@@ -10,17 +10,32 @@
 
 import json
 import os
+import time
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+    OpenAI,
+)
+
+# DeepSeek 瞬时故障（断连/超时/限流/5xx）的自动重试；
+# 重试耗尽仅报错不退出 —— 演示中网络抖动不应杀死整个节点进程。
+LLM_MAX_RETRIES = 3
+LLM_RETRY_INTERVAL = 2.0   # s
 
 SYSTEM_PROMPT = """你是机器人指令解析器。把用户指令转成 JSON。
 action 只能是 "pick"（抓取）或 "place"（放置）。
 格式：{"target_object": string, "action": "pick"|"place", "destination": string|null, "constraints": string[]}
 例：帮我拿可乐 → {"target_object": "可乐", "action": "pick", "destination": null, "constraints": []}
 """
+
+# 可重试的瞬时错误类型
+_TRANSIENT_ERRORS = (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
 
 
 class LLMPlannerNode(Node):
@@ -35,16 +50,40 @@ class LLMPlannerNode(Node):
         self.get_logger().info("LLM Planner ready. Publishing to /llm_command. Type a command and press Enter.")
 
     def parse_and_publish(self, user_text: str) -> dict:
-        """调 DeepSeek 把自然语言解析为 JSON 指令，发布到 /robot_command。"""
-        response = self.client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
-            response_format={"type": "json_object"},
-        )
-        raw = response.choices[0].message.content
+        """调 DeepSeek 把自然语言解析为 JSON 指令，发布到 /llm_command。
+
+        瞬时错误自动重试至 LLM_MAX_RETRIES 次；重试耗尽返回 {}（不发布）。
+        """
+        raw = None
+        for attempt in range(1, LLM_MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_text},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                raw = response.choices[0].message.content
+                break
+            except _TRANSIENT_ERRORS as e:
+                self.get_logger().warn(
+                    f"LLM API transient error (attempt {attempt}/{LLM_MAX_RETRIES}): {e}"
+                )
+                if attempt < LLM_MAX_RETRIES:
+                    time.sleep(LLM_RETRY_INTERVAL)
+            except Exception as e:
+                # 不可恢复错误（鉴权/参数等）：报错并放弃本次指令
+                self.get_logger().error(f"LLM API call failed, giving up: {e}")
+                return {}
+
+        if raw is None:
+            self.get_logger().error(
+                f"LLM unreachable after {LLM_MAX_RETRIES} retries, command dropped."
+            )
+            return {}
+
         self.get_logger().info(f"LLM response: {raw}")
         try:
             cmd = json.loads(raw)
@@ -69,7 +108,11 @@ def main():
                 break
             if not user_text:
                 continue
-            node.parse_and_publish(user_text)
+            try:
+                node.parse_and_publish(user_text)
+            except Exception as e:
+                # 兜底：任何未预期异常只报错，保持节点存活等待下一条指令
+                node.get_logger().error(f"Unexpected error handling command: {e}")
     except KeyboardInterrupt:
         pass
     node.destroy_node()
