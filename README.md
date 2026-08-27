@@ -56,17 +56,33 @@ DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划
 │       └── moveit_resources/         # moveit_resources_panda_description / _moveit_config
 ├── code/python/                      # ROS 2 Python 节点 (uv 项目 robot_arm_demo)
 │   └── src/robot_arm_demo/
-│       ├── panda_mujoco/             # ★ demo 的 4 个节点
-│       │   ├── perception_node.py            # Qwen-VL / 颜色分割 → /robot_command
+│       ├── core/                      # ★ 机器人无关核心逻辑（零 ROS import，pytest 可测）
+│       │   ├── data.py                #   ArmConfig/ObjectConfig/GraspConfig/CameraConfig/TaskCommand
+│       │   ├── interfaces.py          #   Protocol: ArmController/Gripper/ObjectPoseSource/...
+│       │   ├── pick_place.py          #   通用 pick-place 状态机 (PickPlaceController)
+│       │   ├── grasp.py / command.py / camera.py   # 抓取判定 / JSON 契约 / 反投影
+│       ├── adapters/                  # ★ core 接口的 ROS 实现
+│       │   ├── moveit_arm.py          #   MoveGroup action + Planning Scene → ArmController
+│       │   ├── gripper_action.py      #   GripperCommand action → Gripper
+│       │   ├── mujoco_free_joint.py   #   FreeJointStateArray → ObjectPoseSource
+│       │   └── detectors.py           #   颜色分割(主) + Qwen-VL(兜底)
+│       ├── demos/panda_mujoco/        # ★ 本 demo：配置 + thin 启动节点
+│       │   ├── config.py              #   全部机器人/物体/相机参数（新臂只改这里）
+│       │   ├── perception_node.py     #   Qwen-VL / 颜色分割 → /robot_command
 │       │   ├── pick_place_state_machine.py  # MoveIt + 夹爪 + 纯物理夹持
-│       │   ├── llm_planner.py               # DeepSeek → /llm_command
-│       │   └── coke_pose_monitor.py         # 调试用 (可乐真实位姿回放)
-│       └── (geometry.py / trajectory.py / planar_arm.py ... 等工具模块)
+│       │   ├── llm_planner.py         #   DeepSeek → /llm_command
+│       │   └── coke_pose_monitor.py   #   调试用 (可乐真实位姿回放)
+│       └── geometry.py / trajectory.py / planar_arm.py ...  # 独立 2D 平面臂 demo
 ├── scripts/
 │   └── start-demo-mujoco.sh          # tmux 一键启动 (4 窗格: sim+MoveIt / 感知 / 状态机 / LLM)
 ├── ros2-build/                       # 本机构建脚本 + runbook (ROS2/mujoco 编译 + 补丁)
 └── .env.example                     # API key 模板（真实 key 经 ~/.zshrc export）
 ```
+
+> **添加新机械臂 demo**：`core/` 与 `adapters/` 机器人无关，新臂无需改动它们。只需
+> ① `demos/<name>_mujoco/config.py`（按新臂填 ArmConfig/ObjectConfig 等数值）+
+> 薄入口节点；② `ros2_ws/src/<name>_demo` 配置包（URDF/MJCF/controllers.yaml，可仿照
+> panda 包）；③ 一份 start 脚本副本。参数数值经 golden 测试锁定迁移（见 tests/）。
 
 ---
 
@@ -178,15 +194,15 @@ source ~/ros2_jazzy/.venv/bin/activate
 source ~/ros2_jazzy/install/setup.zsh; source ~/ros2_jazzy/extra_ws/install/setup.zsh; source ~/study/robot_demo/ros2_ws/install/setup.zsh
 export DYLD_LIBRARY_PATH=".../mujoco_vendor/opt/mujoco_vendor/lib:${DYLD_LIBRARY_PATH}"
 # 若 ~/.zshrc 已 export 则无需此行，否则：export DASHSCOPE_API_KEY=sk-...
-cd ~/study/robot_demo/code/python && PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.perception_node
+cd ~/study/robot_demo/code/python && PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.perception_node
 ```
 ```bash
 # 终端 2: 状态机
-(同上 source; 无需 API key)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.pick_place_state_machine
+(同上 source; 无需 API key)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.pick_place_state_machine
 ```
 ```bash
 # 终端 3: LLM Planner
-(同上 source; 若 ~/.zshrc 已 export 则无需设 key)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.llm_planner
+(同上 source; 若 ~/.zshrc 已 export 则无需设 key)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.llm_planner
 ```
 
 ### 4.3 触发

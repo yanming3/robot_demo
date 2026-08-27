@@ -85,17 +85,17 @@ tmux send-keys -t "$SESSION_NAME" \
 log "启动感知节点..."
 tmux split-window -h -t "$SESSION_NAME:0"
 tmux send-keys -t "$SESSION_NAME" \
-    "$(common_env); export DASHSCOPE_API_KEY; cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.perception_node" C-m
+    "$(common_env); export DASHSCOPE_API_KEY; cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.perception_node" C-m
 
 log "启动状态机（纯物理夹持）..."
 tmux split-window -v -t "$SESSION_NAME:0.1"
 tmux send-keys -t "$SESSION_NAME" \
-    "$(common_env); cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.pick_place_state_machine" C-m
+    "$(common_env); cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.pick_place_state_machine" C-m
 
 log "启动 LLM Planner..."
 tmux split-window -v -t "$SESSION_NAME:0.0"
 tmux send-keys -t "$SESSION_NAME" \
-    "$(common_env); export DEEPSEEK_API_KEY; cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.llm_planner" C-m
+    "$(common_env); export DEEPSEEK_API_KEY; cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.llm_planner" C-m
 
 tmux select-layout -t "$SESSION_NAME" tiled
 
