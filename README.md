@@ -3,7 +3,7 @@
 用自然语言「帮我拿可乐」驱动 Franka Panda 机械臂完成**物理抓取**的完整 demo：
 DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划 → MuJoCo 仿真里的 Panda + 夹爪物理夹持可乐。
 
-本仓库是原阿里云主机版本的**本地 macOS 移植版**，用 **MuJoCo + mujoco_ros2_control** 替代原 Gazebo Harmonic。所有依赖从源码构建，可在本机（Intel macOS）完整运行。
+本仓库用 **MuJoCo + mujoco_ros2_control** 作为物理仿真后端，所有依赖从源码构建，可在本机（Intel macOS）完整运行。
 
 > 环境关键：Intel macOS、ROS 2 **Jazzy** 源码构建、**Python 3.11** venv、**SIP 已禁用**。
 
@@ -65,7 +65,7 @@ DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划
 ├── scripts/
 │   └── start-demo-mujoco.sh          # tmux 一键启动 (4 窗格: sim+MoveIt / 感知 / 状态机 / LLM)
 ├── ros2-build/                       # 本机构建脚本 + runbook (ROS2/mujoco 编译 + 补丁)
-└── .env                              # DASHSCOPE_API_KEY / DEEPSEEK_API_KEY
+└── .env.example                     # API key 模板（真实 key 经 ~/.zshrc export）
 ```
 
 ---
@@ -166,7 +166,7 @@ source ~/ros2_jazzy/install/setup.zsh
 source ~/ros2_jazzy/extra_ws/install/setup.zsh
 source ~/study/robot_demo/ros2_ws/install/setup.zsh
 export DYLD_LIBRARY_PATH="$HOME/ros2_jazzy/extra_ws/install/mujoco_vendor/opt/mujoco_vendor/lib:${DYLD_LIBRARY_PATH}"
-export DASHSCOPE_API_KEY=sk-... DEEPSEEK_API_KEY=sk-...   # 或 source .env
+# API key 已在 ~/.zshrc 中 export；若未配置可在此临时设置
 ros2 launch panda_mujoco_demo panda_mujoco.launch.py headless:=false
 #      ↑ headless:=true 无 GUI, false 弹 MuJoCo 窗口看机械臂
 # 看到日志 "You can start planning now!" = MoveIt 就绪
@@ -177,7 +177,7 @@ ros2 launch panda_mujoco_demo panda_mujoco.launch.py headless:=false
 source ~/ros2_jazzy/.venv/bin/activate
 source ~/ros2_jazzy/install/setup.zsh; source ~/ros2_jazzy/extra_ws/install/setup.zsh; source ~/study/robot_demo/ros2_ws/install/setup.zsh
 export DYLD_LIBRARY_PATH=".../mujoco_vendor/opt/mujoco_vendor/lib:${DYLD_LIBRARY_PATH}"
-export DASHSCOPE_API_KEY=sk-...
+# 若 ~/.zshrc 已 export 则无需此行，否则：export DASHSCOPE_API_KEY=sk-...
 cd ~/study/robot_demo/code/python && PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.perception_node
 ```
 ```bash
@@ -186,7 +186,7 @@ cd ~/study/robot_demo/code/python && PYTHONPATH=src:$PYTHONPATH python3 -m robot
 ```
 ```bash
 # 终端 3: LLM Planner
-(同上 source; export DEEPSEEK_API_KEY=sk-...)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.llm_planner
+(同上 source; 若 ~/.zshrc 已 export 则无需设 key)  PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.panda_mujoco.llm_planner
 ```
 
 ### 4.3 触发
@@ -226,7 +226,7 @@ ros2 topic list | grep -E "camera|robot_command|llm_command|joint_states"
 - `mjcf/scene.xml`：场景（桌子、可乐、摄像头、home 关键帧）；`<geom>` 摩擦、可乐尺寸。
 - `urdf/panda.mujoco.urdf.xacro`：`MujocoSystemInterface` + `CameraPlugin` + `camera_link` TF。
 - `pick_place_state_machine.py`：`GRIPPER_GRASP_POS`（夹持过盈量）、夹持高度、`max_effort`。
-- `.env`：`DASHSCOPE_API_KEY`(Qwen-VL) + `DEEPSEEK_API_KEY`(DeepSeek)。
+- **API key**：在 `~/.zshrc` 中 export `DASHSCOPE_API_KEY`(Qwen-VL) + `DEEPSEEK_API_KEY`(DeepSeek)。详见 `.env.example`。
 
 ### 5.3 关键物理解调参数（抓取）
 | 参数 | 值 | 说明 |
@@ -239,13 +239,13 @@ ros2 topic list | grep -E "camera|robot_command|llm_command|joint_states"
 
 ---
 
-## 6. 关于本机 macOS 的移植改动（重要）
+## 6. macOS 构建与渲染说明
 
 若在**同类型 Intel mac** 上重新编，需注意这些 macOS 特有修复（详见 `ros2-build/runbook.md`）：
 
 ### 6.1 Camera / 渲染（macOS 特有）
 - **Camera 离屏渲染用 windowless CGL**（`mujoco_ros2_control/camera_plugin.cpp`），而非 GLFW——GLFW 在工作者线程建窗会触发 AppKit `NSMenu` 断言崩溃。`MUJOCO_GL` 在 3.4.0 无 Metal，只有 OpenGL。
-- **MuJoCo 原生 viewer 窗口放主线程**：移植了 fork 的 `macos_ui.{hpp,cpp}`（CV 交接）+ 把 `ros2_control_node` 的 `executor->spin()` 挪后台线程、主线程跑 UI 任务。`headless:=false` 才能弹窗且不崩。
+- **MuJoCo 原生 viewer 窗口放主线程**：macOS 上 viewer 需在主线程渲染（`macos_ui.{hpp,cpp}` 用 CV 交接），并把 `ros2_control_node` 的 `executor->spin()` 挪后台线程、主线程跑 UI 任务。`headless:=false` 才能弹窗且不崩。
 - `mujoco_ros2_control` 需编译 `glfw_corevideo.mm`/`macos_gui.mm`（`enable_language(OBJCXX)`）并链 `Cocoa/IOKit/CoreVideo/CoreFoundation` framework。
 
 ### 6.2 其它 mac 修复
@@ -280,4 +280,4 @@ ros2 topic list | grep -E "camera|robot_command|llm_command|joint_states"
 - **MuJoCo 3.4.0**：物理引擎 + 渲染（macOS OpenGL/CGL）
 - **DeepSeek**（LLM 指令解析）、**Qwen-VL (DashScope)**（视觉定位）
 
-原工程参考：`robot_demo_001`（云主机版，Gazebo 迁移而来）。详见 `ros2-build/runbook.md`（完整构建排错 + 补丁）。
+详见 `ros2-build/runbook.md`（完整构建排错 + 补丁）。
