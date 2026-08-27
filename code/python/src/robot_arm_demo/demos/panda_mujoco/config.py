@@ -6,9 +6,11 @@ from __future__ import annotations
 from ...core.data import (
     ArmConfig,
     CameraConfig,
+    DetectorConfig,
     GraspConfig,
     ObjectConfig,
     PickPlaceConfig,
+    VlmConfig,
 )
 from ...core.grasp import build_grasp_config
 
@@ -75,7 +77,37 @@ def build_panda_mujoco_config() -> PickPlaceConfig:
         assumed_depth=0.76,
     )
 
-    return PickPlaceConfig(arm=arm, object=obj, grasp=grasp, camera=camera)
+    # 颜色分割：可乐材质 rgba=(1,0.08,0.08) 渲染后 ≈ RGB(95,8,6)，顶部有
+    # 亮红高光(>120)。R∈[60,160] 覆盖暗红主体 + 高光，G/B 压死以排除棕色
+    # 桌面 / 橙色机械臂；<50 像素视为未检测到。
+    detector = DetectorConfig(
+        name="cola",
+        mask_r_min=60,
+        mask_r_max=160,
+        mask_g_max=40,
+        mask_b_max=40,
+        min_pixels=50,
+    )
+
+    # VLM 兜底（Qwen-VL，OpenAI 兼容接口）
+    vlm = VlmConfig(
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen-vl-max",
+        prompt_template="""图片尺寸是 640x480 像素。这是机器人仿真相机俯视拍摄桌面的图片。
+请仔细识别图中的"{target}"（红色罐装饮料），返回它的 bounding box。
+格式：{{"objects": [{{"name": "{target}", "bbox": [x_min, y_min, x_max, y_max]}}]}}
+坐标必须在 0-640 (x) 和 0-480 (y) 范围内。只返回 JSON。如果看不到，返回 {{"objects": []}}。""",
+        max_retries=3,
+    )
+
+    return PickPlaceConfig(
+        arm=arm,
+        object=obj,
+        grasp=grasp,
+        camera=camera,
+        detector=detector,
+        vlm=vlm,
+    )
 
 
 def _build_panda_grasp() -> GraspConfig:

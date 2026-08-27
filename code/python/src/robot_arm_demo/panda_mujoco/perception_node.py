@@ -24,37 +24,21 @@ from geometry_msgs.msg import PointStamped
 from openai import OpenAI
 from mujoco_ros2_control_msgs.msg import FreeJointStateArray
 
-# 相机内参（MuJoCo 相机 fovy 已按 fx=554 校准，见 scene.xml）
-# fx = (width/2) / tan(fov/2), fov=1.047 rad (60°)
-CAMERA_FX = 554.0
-CAMERA_FY = 554.0
-CAMERA_CX = 320.0
-CAMERA_CY = 240.0
+from robot_arm_demo.demos.panda_mujoco.config import build_panda_mujoco_config
 
-# demo 阶段假设深度（camera 坐标系 Z 方向距离）
-# MuJoCo 里可乐中心 (0.3,0,0.061), 相机 (0.4,0.5,0.625)（panda_link0 为原点），
-# 距离约 0.76m。相机 fovy 已按 fx=554 校准，反投影恢复的可乐深度实测 0.7603。
-ASSUMED_DEPTH = 0.76
+# 说明：相机内参/假设深度/VLM 参数/颜色阈值原先硬编码于本文件顶部，
+# 现全部由 build_panda_mujoco_config() 提供（数值逐位一致，见 golden 测试）。
 
-DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-VLM_MODEL = "qwen-vl-max"
-
-VLM_PROMPT_TEMPLATE = """图片尺寸是 640x480 像素。这是机器人仿真相机俯视拍摄桌面的图片。
-请仔细识别图中的"{target}"（红色罐装饮料），返回它的 bounding box。
-格式：{{"objects": [{{"name": "{target}", "bbox": [x_min, y_min, x_max, y_max]}}]}}
-坐标必须在 0-640 (x) 和 0-480 (y) 范围内。只返回 JSON。如果看不到，返回 {{"objects": []}}。"""
-
-# VLM 重试次数
-VLM_MAX_RETRIES = 3
 
 class PerceptionNode(Node):
     def __init__(self):
         super().__init__("perception_node")
+        self.cfg = build_panda_mujoco_config()
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
             self.get_logger().error("DASHSCOPE_API_KEY not set, exiting.")
             raise SystemExit(1)
-        self.client = OpenAI(api_key=api_key, base_url=DASHSCOPE_BASE_URL)
+        self.client = OpenAI(api_key=api_key, base_url=self.cfg.vlm.base_url)
 
         self.latest_image = None
         self.image_lock = threading.Lock()
@@ -111,7 +95,7 @@ class PerceptionNode(Node):
     def coke_gt_callback(self, msg):
         """缓存可乐 ground truth world 位姿（MuJoCo 真实物理位置）。"""
         for fj in msg.free_joints:
-            if fj.name == "coke":
+            if fj.name == self.cfg.object.object_id:
                 with self.coke_gt_lock:
                     self.latest_coke_gt = (
                         fj.pose.pose.position.x,
@@ -194,12 +178,15 @@ class PerceptionNode(Node):
         返回 {"name", "bbox", "center"}，center 为最大红色连通区域的质心 (u,v)。
         """
         import numpy as np
+        det = self.cfg.detector
         arr = np.array(img).astype(int)
         r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        # 可乐材质 rgba=1,0.08,0.08 渲染后 ≈ RGB(95,8,6)；顶部有亮红高光(>120)。
-        # R∈[60,160] 覆盖暗红主体 + 高光，G/B 严格压死以排除棕色桌面 / 橙色机械臂。
-        mask = (r >= 60) & (r <= 160) & (g < 40) & (b < 40)
-        if int(mask.sum()) < 50:
+        # 目标物体特征色掩码：阈值来自 detector 配置（见 config 注释）
+        mask = (
+            (r >= det.mask_r_min) & (r <= det.mask_r_max)
+            & (g < det.mask_g_max) & (b < det.mask_b_max)
+        )
+        if int(mask.sum()) < det.min_pixels:
             self.get_logger().warn(
                 f"Color detect: only {mask.sum()} red pixels found."
             )
@@ -225,7 +212,7 @@ class PerceptionNode(Node):
             f"Color detect: bbox=[{x_min},{y_min},{x_max},{y_max}], "
             f"center=({cx:.1f},{cy:.1f}), pixels={len(xs)}"
         )
-        return {"name": "cola", "bbox": [x_min, y_min, x_max, y_max],
+        return {"name": det.name, "bbox": [x_min, y_min, x_max, y_max],
                 "center": (cx, cy)}
 
     def detect_object(self, target_name: str, img) -> dict:
@@ -238,11 +225,12 @@ class PerceptionNode(Node):
         img.save(buf, format="JPEG")
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-        prompt = VLM_PROMPT_TEMPLATE.format(target=target_name)
-        for attempt in range(1, VLM_MAX_RETRIES + 1):
+        prompt = self.cfg.vlm.prompt_template.format(target=target_name)
+        vlm_retries = self.cfg.vlm.max_retries
+        for attempt in range(1, vlm_retries + 1):
             try:
                 response = self.client.chat.completions.create(
-                    model=VLM_MODEL,
+                    model=self.cfg.vlm.model,
                     messages=[{
                         "role": "user",
                         "content": [
@@ -253,7 +241,7 @@ class PerceptionNode(Node):
                     response_format={"type": "json_object"},
                 )
                 raw = response.choices[0].message.content
-                self.get_logger().info(f"VLM response (attempt {attempt}/{VLM_MAX_RETRIES}): {raw}")
+                self.get_logger().info(f"VLM response (attempt {attempt}/{vlm_retries}): {raw}")
                 result = json.loads(raw)
                 objects = result.get("objects", [])
                 if objects:
@@ -283,24 +271,25 @@ class PerceptionNode(Node):
         self.get_logger().info(f"bbox center: u={u:.1f}, v={v:.1f}")
 
         # 优先读深度图真实深度；读不到（无深度消息/深度<=0）回退到假设深度
+        assumed_depth = self.cfg.camera.assumed_depth
         Z = self._read_depth_at(u, v)
         if Z is None or Z <= 0.0:
             self.get_logger().warn(
-                f"No valid depth at ({u:.1f},{v:.1f}), fallback to ASSUMED_DEPTH={ASSUMED_DEPTH}"
+                f"No valid depth at ({u:.1f},{v:.1f}), fallback to assumed_depth={assumed_depth}"
             )
-            Z = ASSUMED_DEPTH
+            Z = assumed_depth
         else:
             self.get_logger().info(f"Measured depth at ({u:.1f},{v:.1f}): Z={Z:.4f}")
 
-        # 针孔相机模型反投影
-        X = (u - CAMERA_CX) * Z / CAMERA_FX
-        Y = (v - CAMERA_CY) * Z / CAMERA_FY
+        # 针孔相机模型反投影（内参来自 camera 配置）
+        cam = self.cfg.camera
+        X = (u - cam.cx) * Z / cam.fx
+        Y = (v - cam.cy) * Z / cam.fy
         self.get_logger().info(f"3D point in camera_link: X={X:.3f}, Y={Y:.3f}, Z={Z:.3f}")
 
-        # demo 阶段 Z 下限保护：panda_link0 坐标系下 Z < 0.2 不可达
-        # 这里先不做限制，在 transform_to_base 之后做
+        # demo 阶段 Z 下限保护：base 坐标系下 Z 过低不可达，在 transform_to_base 之后做
         point = PointStamped()
-        point.header.frame_id = "camera_link"
+        point.header.frame_id = self.cfg.camera.frame_id
         point.header.stamp = self.get_clock().now().to_msg()
         point.point.x = float(X)
         point.point.y = float(Y)
@@ -308,25 +297,28 @@ class PerceptionNode(Node):
         return point
 
     def transform_to_base(self, point_camera: PointStamped) -> list:
-        """tf2 转换 camera_link → panda_link0。"""
+        """tf2 转换 camera frame → 机械臂 base frame。"""
+        base_frame = self.cfg.arm.base_frame
         if self.tf_buffer is None:
             self.get_logger().error("tf2 not available.")
             return None
         try:
             point_base = self.tf_buffer.transform(
-                point_camera, "panda_link0", timeout=rclpy.duration.Duration(seconds=2.0)
+                point_camera, base_frame, timeout=rclpy.duration.Duration(seconds=2.0)
             )
             x = point_base.point.x
             y = point_base.point.y
             z = point_base.point.z
 
-            # 可达性保护：X < 0.25 时 Panda 不可达
-            # Z 不做 clamp —— 输出的 z 是可乐中心高度，状态机会加上 link8 到指尖偏移
-            if x < 0.25:
-                self.get_logger().warn(f"X={x:.3f} too close, clamping to 0.25")
-                x = 0.25
+            # 可达性保护：X 过近时不可达
+            # Z 不做 clamp —— 输出的 z 是目标中心高度，状态机会加 link8 到指尖偏移
+            if x < self.cfg.arm.reachable_x_min:
+                self.get_logger().warn(
+                    f"X={x:.3f} too close, clamping to {self.cfg.arm.reachable_x_min}"
+                )
+                x = self.cfg.arm.reachable_x_min
 
-            self.get_logger().info(f"3D point in panda_link0: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+            self.get_logger().info(f"3D point in {base_frame}: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
             return [x, y, z]
         except Exception as e:
             self.get_logger().error(f"tf2 transform failed: {e}")
@@ -375,9 +367,10 @@ class PerceptionNode(Node):
             self.get_logger().error("Coordinate transform failed.")
             return
 
-        # 4.5 合理性校验：可乐应在桌面上方合理范围，挡住 VLM 幻觉（如 Z<0 或越界）
+        # 4.5 合理性校验：目标应在桌面上方合理范围，挡住 VLM 幻觉（如 Z<0 或越界）
         x, y, z = position
-        if not (0.20 <= x <= 0.60 and -0.35 <= y <= 0.35 and 0.0 <= z <= 0.30):
+        x_min, x_max, y_min, y_max, z_min, z_max = self.cfg.arm.sanity_box
+        if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max):
             self.get_logger().error(
                 f"Detected position out of table range: ({x:.3f},{y:.3f},{z:.3f}), rejected."
             )

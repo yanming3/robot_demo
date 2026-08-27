@@ -28,6 +28,8 @@ from mujoco_ros2_control_msgs.msg import FreeJointStateArray
 
 from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 
+from robot_arm_demo.demos.panda_mujoco.config import build_panda_mujoco_config
+
 
 def _wait_future(node, future, timeout=30.0):
     """Wait for a future without deadlocking."""
@@ -37,76 +39,11 @@ def _wait_future(node, future, timeout=30.0):
     return future.done()
 
 
-# ── 可乐几何参数（来自 SDF）──
-# 圆柱体 radius=0.033, length=0.122
-COKE_RADIUS = 0.033
-COKE_HEIGHT = 0.122
-
-# ── Panda 夹爪几何（来自 URDF）──
-# panda_finger_joint 范围 0.0~0.04（每侧），最大张开 0.08m
-# panda_hand → 手指根部 z=0.0584，指尖闭合点(TCP) z=0.1034
-# position constraint 作用在 panda_link8，link8 到 panda_hand 无偏移
-GRIPPER_MAX_WIDTH = 0.08
-GRIPPER_OPEN_POS = 0.04        # 每侧手指位置，总宽 0.08m
-# 历史参考：一次性命令手指到过盈位置(0.024)曾被用于纯物理夹持，
-# 实测会穿透可乐碰撞体或夹不紧，导致 LIFT 滑落。现已由 close_gripper_staged
-# 的两段式逐步收紧取代，此值仅作记录，不再被 run() 使用。
-GRIPPER_GRASP_POS = 0.024      # （弃用）每侧手指位置，总宽 0.048m（过盈 0.018m）
-LINK8_TO_FINGERTIP = 0.1034    # link8 到指尖闭合点距离
-# link8 最低下降高度。hand_c 掌心碰撞体底部在 link8 下方约 0.0403（MuJoCo aabb 实测），
-# 可乐顶面 z≈0.122。若 link8 降到 0.16，掌心底部≈0.1197 会压到可乐顶面、把可乐撞倒
-# （历史 bug：DESCEND 后可乐 z 从 0.059 掉到 0.0126 被撞倒）。0.20 让掌心底部≈0.1597，
-# 离可乐顶面约 3.8cm 安全距离（对应 git 历史 cb50c5f）。
-MIN_LINK8_Z = 0.20
-
-# ── 动作速度（演示观察用）──
-# MoveIt 的 max_velocity_scaling_factor / max_acceleration_scaling_factor 默认值。
-# 1.0 = 全速。降到 0.3 让机械臂每个移动阶段（MOVE_ABOVE → DESCEND → LIFT →
-# MOVE_TO_PLACE → RELEASE）放慢到 30% 速度，便于肉眼观察轨迹。MICRO_LIFT
-# 已单独用 0.1（更慢）。想统一调快/调慢只改这一处。
-DEFAULT_VELOCITY_SCALING = 0.3
-
-# ── 放置位置（demo 固定场景）──
-# 可乐中心放置位置。抓取点在 +X 方向 (0.3, 0)；把放置点选在 +Y 方向 (0, 0.28)，
-# LIFT 之后机械臂需要绕 base（joint1）旋转 ~90° 才能到达，旋转动作肉眼清晰，
-# 强化「抓起来→转身→放到新位置」的演示效果。z=0.061 底部贴桌面。
-# （在桌子内 y∈[-0.4,0.4]、距 base 0.28m 可达。）
-PLACE_POSITION = [0.0, 0.28, 0.061]
-
-# ── home 关节位形（复位目标）──
-# 与 config/initial_positions.yaml 及 scene.xml 的 home keyframe 一致。
-# 每轮抓取结束后必须把 arm 复位到该位形，否则下一轮起点关节可能漂移到
-# 关节极限外（历史 bug：笛卡尔 position constraint 对 7-DOF 冗余臂不唯一，
-# IK 把 panda_joint2 解到 -1.83299 越界，下一轮 MOVE_ABOVE 被
-# CheckStartStateBounds 拒 → START_STATE_INVALID）。
-HOME_JOINT_NAMES = [
-    "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
-    "panda_joint5", "panda_joint6", "panda_joint7",
-]
-HOME_JOINT_VALUES = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-HOME_JOINT_TOLERANCE = 0.01   # 每关节 ±0.01 rad（约 0.57°）容差，给 IK 留裕量
-
-# ── 逐步收紧 + 微抬验证参数（防滑，参考 so101 的 contact_hold / micro_lift）──
-# 核心思想：不要一次性命令手指到过盈位置（会穿透/夹不紧），而是
-# ① 粗调大步逼近 → ② 精调小步收紧 → ③ 微抬验证可乐物理抓牢 → ④ 才完整抬起。
-GRIPPER_COARSE_STEP = 0.003    # 粗调步长（两段式第一阶段，m）
-GRIPPER_FINE_STEP = 0.001      # 精调步长（检测到接触后，m）
-GRIPPER_MIN_QPOS = 0.028       # 收紧安全下限，防手指穿透可乐碰撞体
-CONTACT_QPOS_MIN = 0.030       # 「碰住未穿透」判据下界
-CONTACT_QPOS_MAX = 0.033       # 「碰住」判据上界（= 可乐半径）
-COKE_DISPLACE_MAX = 0.003      # 夹紧过程中可乐位移上限（m）
-MICRO_LIFT_HEIGHT = 0.015      # 微抬高度 1.5cm
-MICRO_LIFT_COKE_Z_MIN = 0.010  # 可乐 z 需跟着抬升 ≥1cm 才算物理抓牢
-MICRO_LIFT_LATERAL_MAX = 0.005 # 微抬侧向漂移上限（m）
-MAX_GRASP_ATTEMPTS = 3         # 1 次初始 + 2 次重试
-GRASP_STABLE_SAMPLES = 2       # 双信号需连续达标采样次数（防抖动）
-GRASP_STABLE_INTERVAL = 0.1    # 双信号采样间隔（s）
-GRASP_STEP_SETTLE = 0.2        # 每步收紧后等待手指/可乐稳定的时间（s）
-
-
 class PickPlaceStateMachine(Node):
     def __init__(self):
         super().__init__("pick_place_state_machine")
+        # 全部机器人/物体/抓取参数来自 demo 配置（原硬编码常量的唯一来源）
+        self.cfg = build_panda_mujoco_config()
         self.move_client = ActionClient(self, MoveGroup, "/move_action")
         self.gripper_client = ActionClient(
             self, GripperCommand, "/panda_hand_controller/gripper_cmd"
@@ -164,15 +101,16 @@ class PickPlaceStateMachine(Node):
             return
         scene = future.result().scene
 
-        # 查找并移除 coke
+        # 查找并移除目标物体
         removed = False
+        oid = self.cfg.object.object_id
         for obj in scene.world.collision_objects:
-            if obj.id == "coke":
+            if obj.id == oid:
                 obj.operation = CollisionObject.REMOVE
                 removed = True
                 break
         if not removed:
-            self.get_logger().info("No 'coke' in planning scene, nothing to remove.")
+            self.get_logger().info(f"No '{oid}' in planning scene, nothing to remove.")
             return
 
         # 应用更新
@@ -182,7 +120,7 @@ class PickPlaceStateMachine(Node):
         if not _wait_future(self, apply_future, timeout=5.0):
             self.get_logger().error("apply_planning_scene timed out")
             return
-        self.get_logger().info("Removed 'coke' from planning scene.")
+        self.get_logger().info(f"Removed '{oid}' from planning scene.")
 
     def joint_state_callback(self, msg):
         """缓存最新 /joint_states 消息，供闭合后读取真实手指位置。"""
@@ -192,7 +130,7 @@ class PickPlaceStateMachine(Node):
     def coke_pose_callback(self, msg):
         """缓存可乐 free joint 的 world 位姿（MuJoCo ground truth）。"""
         for fj in msg.free_joints:
-            if fj.name == "coke":
+            if fj.name == self.cfg.object.object_id:
                 with self.coke_pose_lock:
                     self.latest_coke_pose = (
                         fj.pose.pose.position.x,
@@ -214,8 +152,9 @@ class PickPlaceStateMachine(Node):
             names = list(self.latest_joint_state.name)
             positions = list(self.latest_joint_state.position)
         fingers = {}
+        gripper_names = self.cfg.arm.gripper_joint_names
         for i, name in enumerate(names):
-            if name in ("panda_finger_joint1", "panda_finger_joint2"):
+            if name in gripper_names:
                 fingers[name] = positions[i] if i < len(positions) else float("nan")
         return fingers
 
@@ -256,27 +195,29 @@ class PickPlaceStateMachine(Node):
         else:
             self.get_logger().error("Pick-place failed.")
 
-    def send_move_goal(self, position, orientation=None, velocity_scaling=DEFAULT_VELOCITY_SCALING):
+    def send_move_goal(self, position, orientation=None, velocity_scaling=None):
+        if velocity_scaling is None:
+            velocity_scaling = self.cfg.arm.default_velocity_scaling
         if orientation is None:
             # link8 目标朝向 = home 姿态的 link8 朝向（wxyz），让指尖 pad 竖直向下、
             # 手指水平，精确对准可乐中心。此前误用 [0,1,0,0]（那是 panda_hand 的朝向）
             # 且 z 轴容差 3.14 过宽，MoveIt 解出 z 轴乱转的姿态 → pad 偏离可乐 → 滑脱。
-            orientation = [0.0, 0.9238795, -0.3826834, 0.0]
+            orientation = list(self.cfg.arm.tip_orientation_wxyz)
 
         goal = MoveGroup.Goal()
-        goal.request.group_name = "panda_arm"
-        goal.request.num_planning_attempts = 5
-        goal.request.allowed_planning_time = 5.0
+        goal.request.group_name = self.cfg.arm.move_group_name
+        goal.request.num_planning_attempts = self.cfg.arm.num_planning_attempts
+        goal.request.allowed_planning_time = self.cfg.arm.allowed_planning_time
         goal.request.start_state.is_diff = True
         goal.request.max_velocity_scaling_factor = velocity_scaling
         goal.request.max_acceleration_scaling_factor = velocity_scaling
 
         pos_constraint = PositionConstraint()
-        pos_constraint.header.frame_id = "panda_link0"
-        pos_constraint.link_name = "panda_link8"
+        pos_constraint.header.frame_id = self.cfg.arm.base_frame
+        pos_constraint.link_name = self.cfg.arm.eef_link
         region = SolidPrimitive()
         region.type = SolidPrimitive.SPHERE
-        region.dimensions = [0.005]   # 5mm 容差球，给 IK 更多求解空间
+        region.dimensions = [self.cfg.arm.position_tolerance]   # 容差球，给 IK 更多求解空间
         pos_constraint.constraint_region.primitives.append(region)
         region_pose = Pose()
         region_pose.position.x = position[0]
@@ -287,15 +228,15 @@ class PickPlaceStateMachine(Node):
         pos_constraint.weight = 1.0
 
         ori_constraint = OrientationConstraint()
-        ori_constraint.header.frame_id = "panda_link0"
-        ori_constraint.link_name = "panda_link8"
+        ori_constraint.header.frame_id = self.cfg.arm.base_frame
+        ori_constraint.link_name = self.cfg.arm.eef_link
         ori_constraint.orientation.w = orientation[0]
         ori_constraint.orientation.x = orientation[1]
         ori_constraint.orientation.y = orientation[2]
         ori_constraint.orientation.z = orientation[3]
-        ori_constraint.absolute_x_axis_tolerance = 0.05
-        ori_constraint.absolute_y_axis_tolerance = 0.05
-        ori_constraint.absolute_z_axis_tolerance = 0.05
+        ori_constraint.absolute_x_axis_tolerance = self.cfg.arm.orientation_tolerance
+        ori_constraint.absolute_y_axis_tolerance = self.cfg.arm.orientation_tolerance
+        ori_constraint.absolute_z_axis_tolerance = self.cfg.arm.orientation_tolerance
         ori_constraint.weight = 1.0
 
         goal_constraints = Constraints()
@@ -304,7 +245,7 @@ class PickPlaceStateMachine(Node):
         goal.request.goal_constraints.append(goal_constraints)
         goal.planning_options.plan_only = False
         goal.planning_options.replan = True
-        goal.planning_options.replan_attempts = 2
+        goal.planning_options.replan_attempts = self.cfg.arm.replan_attempts
 
         self.get_logger().info(f"Sending move goal to {position}")
         future = self.move_client.send_goal_async(goal)
@@ -331,38 +272,41 @@ class PickPlaceStateMachine(Node):
             # reported by ros2_control after a move completes. Without this,
             # the next move's allowed_start_tolerance check compares a stale
             # scene state against the live state and rejects the trajectory.
-            time.sleep(0.3)
+            time.sleep(self.cfg.grasp.post_move_settle)
         return success
 
-    def send_joint_goal(self, joint_values, velocity_scaling=DEFAULT_VELOCITY_SCALING):
+    def send_joint_goal(self, joint_values, velocity_scaling=None):
         """按关节角复位到目标位形（JointConstraint）。
 
         与 send_move_goal 的笛卡尔 position/orientation 约束不同，这里直接把
         每个关节钉到目标值（±容差）。7-DOF 冗余臂的笛卡尔约束有无数关节解，
         IK 可能把 wrist（joint2/4）拧到关节极限外；关节约束能解出唯一、明确的
-        位形。用于 RETURN_HOME 复位到 HOME_JOINT_VALUES，保证下一轮起点不越界。
+        位形。用于 RETURN_HOME 复位到 home 关节位形，保证下一轮起点不越界。
         """
+        if velocity_scaling is None:
+            velocity_scaling = self.cfg.arm.default_velocity_scaling
+
         goal = MoveGroup.Goal()
-        goal.request.group_name = "panda_arm"
-        goal.request.num_planning_attempts = 5
-        goal.request.allowed_planning_time = 5.0
+        goal.request.group_name = self.cfg.arm.move_group_name
+        goal.request.num_planning_attempts = self.cfg.arm.num_planning_attempts
+        goal.request.allowed_planning_time = self.cfg.arm.allowed_planning_time
         goal.request.start_state.is_diff = True
         goal.request.max_velocity_scaling_factor = velocity_scaling
         goal.request.max_acceleration_scaling_factor = velocity_scaling
 
         constraints = Constraints()
-        for name, value in zip(HOME_JOINT_NAMES, joint_values):
+        for name, value in zip(self.cfg.arm.home_joint_names, joint_values):
             jc = JointConstraint()
             jc.joint_name = name
             jc.position = value
-            jc.tolerance_above = HOME_JOINT_TOLERANCE
-            jc.tolerance_below = HOME_JOINT_TOLERANCE
+            jc.tolerance_above = self.cfg.arm.home_joint_tolerance
+            jc.tolerance_below = self.cfg.arm.home_joint_tolerance
             jc.weight = 1.0
             constraints.joint_constraints.append(jc)
         goal.request.goal_constraints.append(constraints)
         goal.planning_options.plan_only = False
         goal.planning_options.replan = True
-        goal.planning_options.replan_attempts = 2
+        goal.planning_options.replan_attempts = self.cfg.arm.replan_attempts
 
         self.get_logger().info(
             f"Sending joint goal to home: {joint_values}"
@@ -387,7 +331,7 @@ class PickPlaceStateMachine(Node):
         success = result.result.error_code.val == 1
         self.get_logger().info(f"Joint goal result: error_code={result.result.error_code.val}")
         if success:
-            time.sleep(0.3)
+            time.sleep(self.cfg.grasp.post_move_settle)
         return success
 
     def send_gripper_goal(self, position, max_effort=10.0):
@@ -423,8 +367,8 @@ class PickPlaceStateMachine(Node):
         fingers = self.read_finger_positions()
         if not fingers:
             return None
-        f1 = fingers.get("panda_finger_joint1")
-        f2 = fingers.get("panda_finger_joint2")
+        f1 = fingers.get(self.cfg.arm.gripper_joint_names[0])
+        f2 = fingers.get(self.cfg.arm.gripper_joint_names[1])
         if f1 is None or f2 is None:
             return None
         return (f1 + f2) / 2.0
@@ -442,7 +386,7 @@ class PickPlaceStateMachine(Node):
     def _grasp_verified(self, coke_ref):
         """双信号判定：两指 qpos ∈ [0.030,0.033] 且可乐位移 < 3mm，连续两次达标。"""
         ok_count = 0
-        for sample in range(GRASP_STABLE_SAMPLES):
+        for sample in range(self.cfg.grasp.stable_samples):
             avg = self._read_finger_avg()
             disp = self._coke_displacement_from(coke_ref)
             if avg is None or disp is None:
@@ -450,22 +394,22 @@ class PickPlaceStateMachine(Node):
                     f"[VERIFY_GRASP] 信号缺失 finger_avg={avg} coke_disp={disp}"
                 )
                 return False
-            qpos_ok = CONTACT_QPOS_MIN <= avg <= CONTACT_QPOS_MAX
-            disp_ok = disp < COKE_DISPLACE_MAX
+            qpos_ok = self.cfg.grasp.contact_qpos_min <= avg <= self.cfg.grasp.contact_qpos_max
+            disp_ok = disp < self.cfg.grasp.displacement_tolerance
             self.get_logger().info(
                 f"[VERIFY_GRASP] sample={sample + 1} finger_avg={avg:.4f} "
                 f"coke_disp={disp:.4f} qpos_ok={qpos_ok} disp_ok={disp_ok}"
             )
             if qpos_ok and disp_ok:
                 ok_count += 1
-            if sample < GRASP_STABLE_SAMPLES - 1:
-                time.sleep(GRASP_STABLE_INTERVAL)
-        return ok_count == GRASP_STABLE_SAMPLES
+            if sample < self.cfg.grasp.stable_samples - 1:
+                time.sleep(self.cfg.grasp.stable_interval)
+        return ok_count == self.cfg.grasp.stable_samples
 
     def _step_gripper(self, target, coke_ref, phase):
         """单步收紧并检查：可乐不被推走、手指不穿透。返回是否可继续。"""
         self.send_gripper_goal(target, max_effort=10.0)
-        time.sleep(GRASP_STEP_SETTLE)
+        time.sleep(self.cfg.grasp.step_settle)
         avg = self._read_finger_avg()
         disp = self._coke_displacement_from(coke_ref)
         avg_str = f"{avg:.4f}" if avg is not None else "None"
@@ -477,13 +421,13 @@ class PickPlaceStateMachine(Node):
         if avg is None:
             self.get_logger().error("[CLOSE_GRIPPER] 读不到手指 qpos，中止收紧")
             return False
-        if avg < GRIPPER_MIN_QPOS:
+        if avg < self.cfg.grasp.min_qpos:
             self.get_logger().warn(
                 f"[CLOSE_GRIPPER] 手指 qpos={avg:.4f} 低于安全下限 "
-                f"{GRIPPER_MIN_QPOS}，疑似穿透，中止"
+                f"{self.cfg.grasp.min_qpos}，疑似穿透，中止"
             )
             return False
-        if disp is None or disp >= COKE_DISPLACE_MAX:
+        if disp is None or disp >= self.cfg.grasp.displacement_tolerance:
             self.get_logger().warn(
                 f"[CLOSE_GRIPPER] 可乐被推动 disp={disp_str}，中止（推太狠）"
             )
@@ -497,20 +441,20 @@ class PickPlaceStateMachine(Node):
         阶段2 精调：小步收紧，每步双信号判定，连续达标即成功。
         全程每步检查可乐不被推走、手指不穿透。
         """
-        target = GRIPPER_OPEN_POS
+        target = self.cfg.arm.gripper_open_pos
         final_avg = None
 
         self.get_logger().info(
-            f"[CLOSE_GRIPPER] 阶段1 粗调开始（步长 {GRIPPER_COARSE_STEP * 1000:.0f}mm，"
-            f"起点 {GRIPPER_OPEN_POS}）"
+            f"[CLOSE_GRIPPER] 阶段1 粗调开始（步长 {self.cfg.grasp.coarse_step * 1000:.0f}mm，"
+            f"起点 {self.cfg.arm.gripper_open_pos}）"
         )
-        while target > GRIPPER_MIN_QPOS:
-            target = max(GRIPPER_MIN_QPOS, target - GRIPPER_COARSE_STEP)
+        while target > self.cfg.grasp.min_qpos:
+            target = max(self.cfg.grasp.min_qpos, target - self.cfg.grasp.coarse_step)
             if not self._step_gripper(target, coke_ref, "coarse"):
                 return False, self._read_finger_avg()
             final_avg = self._read_finger_avg()
             # 手指 qpos 进入接触区上沿（可乐表面附近），转精调
-            if final_avg is not None and final_avg <= CONTACT_QPOS_MAX + 0.001:
+            if final_avg is not None and final_avg <= self.cfg.grasp.contact_qpos_max + 0.001:
                 self.get_logger().info(
                     f"[CLOSE_GRIPPER] 粗调到达接触区（avg={final_avg:.4f}），转精调"
                 )
@@ -522,10 +466,10 @@ class PickPlaceStateMachine(Node):
             return False, final_avg
 
         self.get_logger().info(
-            f"[CLOSE_GRIPPER] 阶段2 精调开始（步长 {GRIPPER_FINE_STEP * 1000:.0f}mm）"
+            f"[CLOSE_GRIPPER] 阶段2 精调开始（步长 {self.cfg.grasp.fine_step * 1000:.0f}mm）"
         )
-        while target > GRIPPER_MIN_QPOS:
-            target = max(GRIPPER_MIN_QPOS, target - GRIPPER_FINE_STEP)
+        while target > self.cfg.grasp.min_qpos:
+            target = max(self.cfg.grasp.min_qpos, target - self.cfg.grasp.fine_step)
             if not self._step_gripper(target, coke_ref, "fine"):
                 return False, self._read_finger_avg()
             if self._grasp_verified(coke_ref):
@@ -545,12 +489,13 @@ class PickPlaceStateMachine(Node):
         if before is None:
             self.get_logger().error("[MICRO_LIFT] 微抬前读不到可乐位姿")
             return False
-        target_z = grasp_z + MICRO_LIFT_HEIGHT
+        target_z = grasp_z + self.cfg.grasp.micro_lift_height
+        vsc = self.cfg.grasp.micro_lift_velocity_scaling
         self.get_logger().info(
             f"[MICRO_LIFT] 慢速微抬到 z={target_z:.4f} "
-            f"（抬 {MICRO_LIFT_HEIGHT * 100:.1f}cm，velocity_scaling=0.1）"
+            f"（抬 {self.cfg.grasp.micro_lift_height * 100:.1f}cm，velocity_scaling={vsc}）"
         )
-        if not self.send_move_goal([ox, oy, target_z], velocity_scaling=0.1):
+        if not self.send_move_goal([ox, oy, target_z], velocity_scaling=vsc):
             self.get_logger().error("[MICRO_LIFT] 微抬移动失败")
             return False
         after = self.read_coke_pose()
@@ -561,12 +506,12 @@ class PickPlaceStateMachine(Node):
         lateral = math.hypot(after[0] - before[0], after[1] - before[1])
         self.get_logger().info(
             f"[MICRO_LIFT] 可乐位移 dz={dz:.4f} lateral={lateral:.4f} "
-            f"（需 dz≥{MICRO_LIFT_COKE_Z_MIN} 且 lateral<{MICRO_LIFT_LATERAL_MAX}）"
+            f"（需 dz≥{self.cfg.grasp.micro_lift_z_min} 且 lateral<{self.cfg.grasp.micro_lift_lateral_max}）"
         )
-        if dz < MICRO_LIFT_COKE_Z_MIN:
+        if dz < self.cfg.grasp.micro_lift_z_min:
             self.get_logger().warn("[MICRO_LIFT] 可乐 z 未跟着抬升 → 未抓牢")
             return False
-        if lateral >= MICRO_LIFT_LATERAL_MAX:
+        if lateral >= self.cfg.grasp.micro_lift_lateral_max:
             self.get_logger().warn("[MICRO_LIFT] 可乐侧向漂移过大 → 可能滑脱")
             return False
         self.get_logger().info("[MICRO_LIFT] 微抬验证通过，可乐物理抓牢")
@@ -580,15 +525,15 @@ class PickPlaceStateMachine(Node):
         返回 (cx, cy, grasp_z, hover_z)；读不到可乐位姿返回 None。
         """
         self.get_logger().warn("[RECOVER] 张开夹爪并重新对准可乐当前位置重试")
-        self.send_gripper_goal(GRIPPER_OPEN_POS, max_effort=0.0)
-        time.sleep(0.3)
+        self.send_gripper_goal(self.cfg.arm.gripper_open_pos, max_effort=0.0)
+        time.sleep(self.cfg.grasp.recover_settle)
         cur = self.read_coke_pose()
         if cur is None:
             self.get_logger().error("[RECOVER] 读不到可乐当前位置，无法重新对准")
             return None
         cx, cy, cz = cur
-        new_grasp_z = max(cz + LINK8_TO_FINGERTIP, MIN_LINK8_Z)
-        new_hover_z = new_grasp_z + 0.12
+        new_grasp_z = max(cz + self.cfg.arm.finger_tip_offset, self.cfg.arm.min_eef_z)
+        new_hover_z = new_grasp_z + self.cfg.grasp.hover_offset
         self.get_logger().info(
             f"[RECOVER] 可乐当前 ({cx:.4f}, {cy:.4f}, {cz:.4f}) "
             f"→ grasp_z={new_grasp_z:.4f}"
@@ -606,29 +551,29 @@ class PickPlaceStateMachine(Node):
         """执行 pick-place 流程。
 
         感知节点给出的 object_pose 是可乐中心在 panda_link0 坐标系下的位置。
-        position constraint 作用在 panda_link8，link8 到指尖有 LINK8_TO_FINGERTIP 偏移。
-        所以要让指尖到达可乐中心高度，link8 目标 z = oz + LINK8_TO_FINGERTIP。
+        position constraint 作用在 panda_link8，link8 到指尖有 self.cfg.arm.finger_tip_offset 偏移。
+        所以要让指尖到达可乐中心高度，link8 目标 z = oz + self.cfg.arm.finger_tip_offset。
         """
         ox, oy, oz = self.object_pose
 
         # 可乐中心高度，夹爪需要让指尖对准这个高度
         # link8 目标 = 可乐中心 + link8 到指尖偏移
-        grasp_z = oz + LINK8_TO_FINGERTIP
+        grasp_z = oz + self.cfg.arm.finger_tip_offset
         # link8 最低下降高度（安全下限）。理想抓取点让指尖对准可乐中心
         # （oz≈0.059 → grasp_z≈0.162），但 0.162 时 hand_c 掌心底部(≈0.1197)与
         # 可乐顶面(0.122)几乎重合，DESCEND 会把可乐撞倒。故下限提到 0.20
-        # （见 MIN_LINK8_Z 常量注释），指尖改夹可乐上半部分。
-        if grasp_z < MIN_LINK8_Z:
+        # （见 self.cfg.arm.min_eef_z 常量注释），指尖改夹可乐上半部分。
+        if grasp_z < self.cfg.arm.min_eef_z:
             self.get_logger().warn(
-                f"grasp_z={grasp_z:.3f} below min {MIN_LINK8_Z}, clamping"
+                f"grasp_z={grasp_z:.3f} below min {self.cfg.arm.min_eef_z}, clamping"
             )
-            grasp_z = MIN_LINK8_Z
-        hover_z = grasp_z + 0.12   # 悬停在抓取点上方 12cm
+            grasp_z = self.cfg.arm.min_eef_z
+        hover_z = grasp_z + self.cfg.grasp.hover_offset   # 悬停在抓取点上方 12cm
 
         # 1. 张开夹爪
         self.state = "OPEN_GRIPPER"
         self.get_logger().info(f"=== State: {self.state} ===")
-        if not self.send_gripper_goal(GRIPPER_OPEN_POS, max_effort=0.0):
+        if not self.send_gripper_goal(self.cfg.arm.gripper_open_pos, max_effort=0.0):
             self.state = "IDLE"
             return False
 
@@ -663,9 +608,9 @@ class PickPlaceStateMachine(Node):
         cur_ox, cur_oy = ox, oy
         cur_grasp_z = grasp_z
         cur_hover_z = hover_z
-        for attempt in range(MAX_GRASP_ATTEMPTS):
+        for attempt in range(self.cfg.grasp.max_grasp_attempts):
             self.get_logger().info(
-                f"=== State: CLOSE_GRIPPER (attempt {attempt + 1}/{MAX_GRASP_ATTEMPTS}) ==="
+                f"=== State: CLOSE_GRIPPER (attempt {attempt + 1}/{self.cfg.grasp.max_grasp_attempts}) ==="
             )
             if attempt > 0:
                 recovered = self.recover_grasp()
@@ -673,7 +618,7 @@ class PickPlaceStateMachine(Node):
                     self.state = "IDLE"
                     return False
                 cur_ox, cur_oy, cur_grasp_z, cur_hover_z = recovered
-                time.sleep(0.3)  # 恢复后让可乐在桌面上落定
+                time.sleep(self.cfg.grasp.recover_settle)  # 恢复后让可乐在桌面上落定
 
             coke_ref = self.read_coke_pose()
             if coke_ref is None:
@@ -709,16 +654,16 @@ class PickPlaceStateMachine(Node):
 
             grasped = True
             self.get_logger().info(
-                f"[GRASP] 物理抓牢验证通过（attempt {attempt + 1}/{MAX_GRASP_ATTEMPTS}）"
+                f"[GRASP] 物理抓牢验证通过（attempt {attempt + 1}/{self.cfg.grasp.max_grasp_attempts}）"
             )
             break
 
         if not grasped:
             self.get_logger().error(
-                f"[GRASP] {MAX_GRASP_ATTEMPTS} 次尝试均未物理抓牢，放弃"
+                f"[GRASP] {self.cfg.grasp.max_grasp_attempts} 次尝试均未物理抓牢，放弃"
             )
             # 放弃：张开夹爪，回到悬停位，避免可乐卡在夹爪里
-            self.send_gripper_goal(GRIPPER_OPEN_POS, max_effort=0.0)
+            self.send_gripper_goal(self.cfg.arm.gripper_open_pos, max_effort=0.0)
             self.send_move_goal([cur_ox, cur_oy, cur_hover_z])
             self.state = "IDLE"
             return False
@@ -727,7 +672,7 @@ class PickPlaceStateMachine(Node):
         #    旋转过程中可乐离桌面更高、更不容易碰到桌子/机械臂。
         self.state = "LIFT"
         self.get_logger().info(f"=== State: {self.state} ===")
-        lift_z = max(cur_hover_z, 0.38)
+        lift_z = max(cur_hover_z, self.cfg.grasp.lift_z_min)
         if not self.send_move_goal([cur_ox, cur_oy, lift_z]):
             self.state = "IDLE"
             return False
@@ -737,8 +682,8 @@ class PickPlaceStateMachine(Node):
         #    旋转动作肉眼清晰可见（演示「抓起来→转身→放到别处」）。
         self.state = "MOVE_TO_PLACE"
         self.get_logger().info(f"=== State: {self.state} ===")
-        px, py, pz = PLACE_POSITION
-        place_grasp_z = pz + LINK8_TO_FINGERTIP
+        px, py, pz = self.cfg.object.place_position
+        place_grasp_z = pz + self.cfg.arm.finger_tip_offset
         self.get_logger().info(
             f"  place target: ({px:.3f}, {py:.3f}, {pz:.3f}), "
             f"grasp_z={place_grasp_z:.3f}"
@@ -757,10 +702,10 @@ class PickPlaceStateMachine(Node):
         # 8. 张开夹爪，可乐落到桌面
         self.state = "RELEASE_GRIPPER"
         self.get_logger().info(f"=== State: {self.state} ===")
-        if not self.send_gripper_goal(GRIPPER_OPEN_POS, max_effort=0.0):
+        if not self.send_gripper_goal(self.cfg.arm.gripper_open_pos, max_effort=0.0):
             self.state = "IDLE"
             return False
-        time.sleep(0.5)   # 让可乐在桌面上落定
+        time.sleep(self.cfg.grasp.release_settle)   # 让可乐在桌面上落定
 
         # 9. 抬起夹爪离开（避免扫倒可乐）
         self.state = "MOVE_AWAY"
@@ -776,7 +721,7 @@ class PickPlaceStateMachine(Node):
         #     关节约束把每个关节钉回 home 值，保证下一轮抓取起点干净、不越界。
         self.state = "RETURN_HOME"
         self.get_logger().info(f"=== State: {self.state} ===")
-        if not self.send_joint_goal(HOME_JOINT_VALUES):
+        if not self.send_joint_goal(self.cfg.arm.home_joint_values):
             self.get_logger().error("RETURN_HOME 复位失败，arm 未回到 home，下一轮可能越界")
             self.state = "IDLE"
             return False

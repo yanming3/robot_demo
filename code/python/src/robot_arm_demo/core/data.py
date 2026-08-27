@@ -108,6 +108,28 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class DetectorConfig:
+    """颜色分割主检测器（特征色阈值随目标物体材质/场景光照而定）。"""
+
+    name: str          # 检测结果回填的名称（感知层对外语义）
+    mask_r_min: int    # R 通道下限（覆盖暗红主体 + 高光）
+    mask_r_max: int    # R 通道上限（排除过曝像素）
+    mask_g_max: int    # G 严格压死 → 排除棕色桌面 / 橙色机械臂
+    mask_b_max: int
+    min_pixels: int    # 少于该像素数视为未检测到
+
+
+@dataclass(frozen=True)
+class VlmConfig:
+    """VLM 兜底检测器（OpenAI 兼容接口）。"""
+
+    base_url: str
+    model: str
+    prompt_template: str   # {target} 占位符
+    max_retries: int
+
+
+@dataclass(frozen=True)
 class PickPlaceConfig:
     """一个 demo 的完整配置（demo 入口构造并注入）。"""
 
@@ -115,6 +137,8 @@ class PickPlaceConfig:
     object: ObjectConfig
     grasp: GraspConfig
     camera: CameraConfig
+    detector: DetectorConfig | None = None   # 感知节点用；纯规划 demo 可省
+    vlm: VlmConfig | None = None             # 颜色分割失败后的兜底
 
 
 @dataclass(frozen=True)
