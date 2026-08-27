@@ -66,13 +66,12 @@ DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划
 │       │   ├── gripper_action.py      #   GripperCommand action → Gripper
 │       │   ├── mujoco_free_joint.py   #   FreeJointStateArray → ObjectPoseSource
 │       │   └── detectors.py           #   颜色分割(主) + Qwen-VL(兜底)
-│       ├── demos/panda_mujoco/        # ★ 本 demo：配置 + thin 启动节点
-│       │   ├── config.py              #   全部机器人/物体/相机参数（新臂只改这里）
-│       │   ├── perception_node.py     #   Qwen-VL / 颜色分割 → /robot_command
-│       │   ├── pick_place_state_machine.py  # MoveIt + 夹爪 + 纯物理夹持
-│       │   ├── llm_planner.py         #   DeepSeek → /llm_command
-│       │   └── coke_pose_monitor.py   #   调试用 (可乐真实位姿回放)
-│       └── geometry.py / trajectory.py / planar_arm.py ...  # 独立 2D 平面臂 demo
+│       └── demos/panda_mujoco/        # ★ 本 demo：配置 + thin 启动节点
+│           ├── config.py              #   全部机器人/物体/相机参数（新臂只改这里）
+│           ├── perception_node.py     #   Qwen-VL / 颜色分割 → /robot_command
+│           ├── pick_place_state_machine.py  # MoveIt + 夹爪 + 纯物理夹持
+│           ├── llm_planner.py         #   DeepSeek → /llm_command
+│           └── coke_pose_monitor.py   #   调试用 (可乐真实位姿回放)
 ├── scripts/
 │   └── start-demo-mujoco.sh          # tmux 一键启动 (4 窗格: sim+MoveIt / 感知 / 状态机 / LLM)
 ├── ros2-build/                       # 本机构建脚本 + runbook (ROS2/mujoco 编译 + 补丁)

@@ -24,3 +24,6 @@ venv/
 
 # uv
 .uv/
+
+# IDE
+.idea/

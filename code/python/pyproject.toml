@@ -14,9 +14,6 @@ dev = [
     "pytest>=8.0",
 ]
 
-[project.scripts]
-robot-arm-demo = "robot_arm_demo.demo:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 
