@@ -71,8 +71,10 @@ def main():
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        executor.shutdown()
 
 
 if __name__ == "__main__":

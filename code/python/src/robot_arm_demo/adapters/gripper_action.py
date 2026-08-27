@@ -1,6 +1,5 @@
 """Gripper 接口的 GripperCommand 实现。
 
-复刻原 send_gripper_goal（返回 reached_goal）与 /joint_states 手指读取
 （缺位置回退 NaN，见 M0 教训：reached_goal ≠ 物理夹持成功的证据）。
 """
 

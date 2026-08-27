@@ -1,6 +1,5 @@
 """感知检测器：颜色分割（主）+ Qwen-VL（兜底）。
 
-逻辑自原 perception_node._color_detect / detect_object 搬入，
 阈值与提示词从 DetectorConfig/VlmConfig 读取。
 """
 

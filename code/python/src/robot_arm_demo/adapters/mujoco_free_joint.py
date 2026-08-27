@@ -1,6 +1,6 @@
 """ObjectPoseSource 的 MuJoCo FreeJointStateArray 实现。
 
-复刻原 coke_pose_callback：按 body 名缓存 free joint 的 world 位姿。
+按 body 名缓存 free joint 的 world 位姿。
 MuJoCo 场景中 panda_link0 即世界原点（world == base frame），
 坐标可直接用于抓取微调。
 """

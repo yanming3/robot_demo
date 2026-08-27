@@ -115,8 +115,9 @@ def main():
                 node.get_logger().error(f"Unexpected error handling command: {e}")
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

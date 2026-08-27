@@ -20,6 +20,7 @@ import time
 import threading
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from mujoco_ros2_control_msgs.msg import FreeJointStateArray
@@ -104,13 +105,22 @@ class CokePoseMonitor(Node):
 
 def main():
     rclpy.init()
+    executor = MultiThreadedExecutor()
     node = CokePoseMonitor()
+    executor.add_node(node)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        executor.shutdown()
 
 
 if __name__ == "__main__":

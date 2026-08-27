@@ -1,8 +1,4 @@
 """ArmController 的 MoveIt2 实现。
-
-逐字段复刻原 pick_place_state_machine.send_move_goal / send_joint_goal /
-remove_coke_from_scene 的 goal 构造与判定逻辑（含成功后 post_move_settle），
-仅把配置项改为从 ArmConfig/GraspConfig 读取。
 """
 
 from __future__ import annotations

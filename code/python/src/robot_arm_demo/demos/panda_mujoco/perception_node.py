@@ -14,8 +14,10 @@ import json
 import math
 import os
 import threading
+import time
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -220,13 +222,23 @@ class PerceptionNode(Node):
 
 def main():
     rclpy.init()
+    executor = MultiThreadedExecutor()
     node = PerceptionNode()
+    executor.add_node(node)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    node.get_logger().info("Perception node spinning on a separate thread.")
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        executor.shutdown()
 
 
 if __name__ == "__main__":
