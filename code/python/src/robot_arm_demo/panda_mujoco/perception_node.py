@@ -1,88 +1,78 @@
 #!/usr/bin/env python3
-"""V5-T005: 感知节点。
+"""感知节点（thin 入口）。
 
-订阅 /camera (RGB) → 收到 LLM 指令后调 VLM 检测目标物体
-→ bbox 中心 + 假设深度 + 内参反投影 → tf2 转换 camera_link → panda_link0
-→ 发布 /robot_command (JSON, 含目标 3D 位置)
+订阅 /camera (RGB) → 收到 LLM 指令后 颜色分割(主)/VLM(兜底) 检测目标物体
+→ bbox 中心 (+假设深度) 内参反投影 → tf2 转换 camera frame → base frame
+→ 发布 /robot_command (JSON, 含目标 3D 位置)。
 
+算法与 ROS 管线在 core/adapters；本文件只做装配与编排。
 环境变量:
     DASHSCOPE_API_KEY  Qwen API 密钥（必需）
 """
 
-import base64
 import json
 import math
 import os
-import time
 import threading
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
-from geometry_msgs.msg import PointStamped
 from openai import OpenAI
-from mujoco_ros2_control_msgs.msg import FreeJointStateArray
 
+from robot_arm_demo.core.camera import backproject_pinhole
+from robot_arm_demo.core.command import parse_task_command
+from robot_arm_demo.adapters.detectors import ColorDetector, QwenVlDetector
+from robot_arm_demo.adapters.logger import RclLogger, Tf2PointTransform
+from robot_arm_demo.adapters.mujoco_free_joint import MujocoFreeJointPoseSource
 from robot_arm_demo.demos.panda_mujoco.config import build_panda_mujoco_config
-
-# 说明：相机内参/假设深度/VLM 参数/颜色阈值原先硬编码于本文件顶部，
-# 现全部由 build_panda_mujoco_config() 提供（数值逐位一致，见 golden 测试）。
 
 
 class PerceptionNode(Node):
     def __init__(self):
         super().__init__("perception_node")
         self.cfg = build_panda_mujoco_config()
+        self.log = RclLogger(self.get_logger())
+
         api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
             self.get_logger().error("DASHSCOPE_API_KEY not set, exiting.")
             raise SystemExit(1)
-        self.client = OpenAI(api_key=api_key, base_url=self.cfg.vlm.base_url)
+        client = OpenAI(api_key=api_key, base_url=self.cfg.vlm.base_url)
+
+        # 检测器：颜色分割优先（快、准、确定性），VLM 兜底
+        self.color_detector = ColorDetector(self.cfg.detector, self.log)
+        self.vlm_detector = QwenVlDetector(self.cfg.vlm, client, self.log)
+
+        # 目标物体 ground truth 位姿源（world == base frame），用于偏差对比
+        self.pose_source = MujocoFreeJointPoseSource(
+            self, self.cfg.object.object_id
+        )
 
         self.latest_image = None
         self.image_lock = threading.Lock()
-
         self.image_sub = self.create_subscription(
             Image, "/camera", self.image_callback, 10
         )
-        # 订阅深度图（32FC1, 640x480），用于可乐位姿的真实深度反投影，
-        # 替代 ASSUMED_DEPTH=0.76 的假设深度。
         # NOTE 2026-08-15: 深度图与 tf/RGB 帧存在时序错位，反投影坐标漂移
-        # （Y 0.001→0.032、Z 0.061→0.098），导致夹爪在 DESCEND 阶段撞倒可乐。
-        # 已停用深度订阅，回退 ASSUMED_DEPTH（固定场景下标定准确）。
-        self.latest_depth = None
-        self.depth_lock = threading.Lock()
-        # self.depth_sub = self.create_subscription(
-        #     Image, "/camera/depth", self.depth_callback, 10
-        # )
-        # 订阅 LLM Planner 发布的指令
+        # （Y 0.001→0.032、Z 0.061→0.098），导致夹爪 DESCEND 撞倒可乐。
+        # 已停用深度订阅，回退 camera.assumed_depth（固定场景标定准确）。
+
         self.command_sub = self.create_subscription(
             String, "/llm_command", self.command_callback, 10
         )
-        # 发布带 3D 位置的指令给状态机
         self.robot_command_pub = self.create_publisher(String, "/robot_command", 10)
-
-        # 订阅可乐 ground truth 位姿（MuJoCo free_joint_state_publisher 发布的
-        # world 坐标，world == panda_link0），用于与 VLM 反投影结果对比，
-        # 第一时间发现 VLM 识别偏差。
-        self.latest_coke_gt = None
-        self.coke_gt_lock = threading.Lock()
-        self.coke_gt_sub = self.create_subscription(
-            FreeJointStateArray,
-            "/free_joint_state_publisher/free_joint_states",
-            self.coke_gt_callback,
-            10,
-        )
 
         # tf2
         self.tf_buffer = None
-        self.tf_listener = None
+        self.transformer = None
         try:
             import tf2_ros
-            import tf2_geometry_msgs  # 注册 PointStamped
+            import tf2_geometry_msgs  # noqa: F401 注册 PointStamped
             self.tf_buffer = tf2_ros.Buffer()
-            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+            tf2_ros.TransformListener(self.tf_buffer, self)
+            self.transformer = Tf2PointTransform(self, self.tf_buffer, self.log)
         except ImportError:
             self.get_logger().warn("tf2_ros not available, coordinate transform disabled.")
 
@@ -92,69 +82,6 @@ class PerceptionNode(Node):
         with self.image_lock:
             self.latest_image = msg
 
-    def coke_gt_callback(self, msg):
-        """缓存可乐 ground truth world 位姿（MuJoCo 真实物理位置）。"""
-        for fj in msg.free_joints:
-            if fj.name == self.cfg.object.object_id:
-                with self.coke_gt_lock:
-                    self.latest_coke_gt = (
-                        fj.pose.pose.position.x,
-                        fj.pose.pose.position.y,
-                        fj.pose.pose.position.z,
-                    )
-                return
-
-    def _read_coke_gt(self):
-        """读最新可乐 ground truth 位姿 (x, y, z)，未收到返回 None。"""
-        with self.coke_gt_lock:
-            return self.latest_coke_gt
-
-    def _log_gt_comparison(self, vlm_position):
-        """打印 VLM 反投影结果 vs ground truth 的对比与偏差。"""
-        gt = self._read_coke_gt()
-        if gt is None:
-            self.get_logger().warn(
-                "[GT-VLM] 未收到可乐 ground truth（free_joint_states），跳过对比"
-            )
-            return
-        dx = vlm_position[0] - gt[0]
-        dy = vlm_position[1] - gt[1]
-        dz = vlm_position[2] - gt[2]
-        dist = math.hypot(math.hypot(dx, dy), dz)
-        self.get_logger().info(
-            f"[GT-VLM] VLM=({vlm_position[0]:.4f}, {vlm_position[1]:.4f}, "
-            f"{vlm_position[2]:.4f})  GT=({gt[0]:.4f}, {gt[1]:.4f}, {gt[2]:.4f})  "
-            f"err=({dx:.4f}, {dy:.4f}, {dz:.4f})  dist={dist:.4f}m"
-        )
-
-    def depth_callback(self, msg):
-        """缓存最新深度图（32FC1, 640x480）。"""
-        with self.depth_lock:
-            self.latest_depth = msg
-
-    def _read_depth_at(self, u: float, v: float):
-        """读深度图 (u,v) 像素的真实深度（米）。失败或深度无效返回 None。
-
-        已停用（2026-08-15）：深度图帧与 tf/RGB 错位导致坐标漂移，恒返回 None
-        强制回退 ASSUMED_DEPTH。见 __init__ 中 depth_sub 的注释。
-        """
-        return None
-        import numpy as np
-        with self.depth_lock:
-            if self.latest_depth is None:
-                return None
-            depth_msg = self.latest_depth
-        if depth_msg.encoding != "32FC1":
-            self.get_logger().warn(f"Unexpected depth encoding: {depth_msg.encoding}")
-            return None
-        arr = np.frombuffer(bytes(depth_msg.data), dtype=np.float32)
-        arr = arr.reshape(depth_msg.height, depth_msg.width)
-        ui = int(round(u))
-        vi = int(round(v))
-        ui = max(0, min(depth_msg.width - 1, ui))
-        vi = max(0, min(depth_msg.height - 1, vi))
-        return float(arr[vi, ui])
-
     def _get_image(self):
         """读最新 RGB 帧转 PIL，保存调试图到 /tmp，返回 img 或 None。"""
         with self.image_lock:
@@ -163,181 +90,68 @@ class PerceptionNode(Node):
                 return None
             image_msg = self.latest_image
         from PIL import Image as PILImage
-        img = PILImage.frombytes("RGB", (image_msg.width, image_msg.height), bytes(image_msg.data))
+        img = PILImage.frombytes(
+            "RGB", (image_msg.width, image_msg.height), bytes(image_msg.data)
+        )
         debug_path = "/tmp/perception_latest.jpg"
         img.save(debug_path, format="JPEG")
         self.get_logger().info(f"Saved debug image to {debug_path}")
         return img
 
-    def _color_detect(self, img) -> dict:
-        """颜色分割检测可乐：暗红特征色 + 最大连通区域质心。
+    def _read_assumed_depth(self):
+        """真实深度路径已停用（时序错位致坐标漂移），恒回退假设深度。"""
+        return self.cfg.camera.assumed_depth
 
-        固定场景（相机固定、光照稳定、可乐暗红）下亚像素级准且确定性，
-        作为主检测器；VLM 仅在其失败时兜底。
-
-        返回 {"name", "bbox", "center"}，center 为最大红色连通区域的质心 (u,v)。
-        """
-        import numpy as np
-        det = self.cfg.detector
-        arr = np.array(img).astype(int)
-        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        # 目标物体特征色掩码：阈值来自 detector 配置（见 config 注释）
-        mask = (
-            (r >= det.mask_r_min) & (r <= det.mask_r_max)
-            & (g < det.mask_g_max) & (b < det.mask_b_max)
+    def _log_gt_comparison(self, position):
+        """打印检测结果 vs ground truth 的对比与偏差。"""
+        gt = self.pose_source.get_object_pose(self.cfg.object.object_id)
+        if gt is None:
+            self.log.warn("[GT-VLM] 未收到可乐 ground truth（free_joint_states），跳过对比")
+            return
+        dx = position[0] - gt[0]
+        dy = position[1] - gt[1]
+        dz = position[2] - gt[2]
+        dist = math.hypot(math.hypot(dx, dy), dz)
+        self.log.info(
+            f"[GT-VLM] VLM=({position[0]:.4f}, {position[1]:.4f}, "
+            f"{position[2]:.4f})  GT=({gt[0]:.4f}, {gt[1]:.4f}, {gt[2]:.4f})  "
+            f"err=({dx:.4f}, {dy:.4f}, {dz:.4f})  dist={dist:.4f}m"
         )
-        if int(mask.sum()) < det.min_pixels:
-            self.get_logger().warn(
-                f"Color detect: only {mask.sum()} red pixels found."
-            )
-            return None
 
-        ys, xs = np.where(mask)
-        # 取最大连通区域，避免零星红色噪声拉偏 bbox；scipy 不可用时退化为
-        # 全 mask 质心（质心本身对离群像素鲁棒）。
-        try:
-            from scipy import ndimage
-            lbl, n = ndimage.label(mask)
-            sizes = ndimage.sum(mask, lbl, range(1, n + 1))
-            k = int(np.argmax(sizes)) + 1
-            ys, xs = np.where(lbl == k)
-        except ImportError:
-            pass
-
-        cx = float(xs.mean())
-        cy = float(ys.mean())
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
-        self.get_logger().info(
-            f"Color detect: bbox=[{x_min},{y_min},{x_max},{y_max}], "
-            f"center=({cx:.1f},{cy:.1f}), pixels={len(xs)}"
-        )
-        return {"name": det.name, "bbox": [x_min, y_min, x_max, y_max],
-                "center": (cx, cy)}
-
-    def detect_object(self, target_name: str, img) -> dict:
-        """调 VLM 检测目标物体，返回 bbox。失败重试最多 VLM_MAX_RETRIES 次。
-
-        img 为 _get_image 已读出的 PIL RGB 图，避免重复读帧。
-        """
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        prompt = self.cfg.vlm.prompt_template.format(target=target_name)
-        vlm_retries = self.cfg.vlm.max_retries
-        for attempt in range(1, vlm_retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.cfg.vlm.model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                            {"type": "text", "text": prompt},
-                        ]
-                    }],
-                    response_format={"type": "json_object"},
-                )
-                raw = response.choices[0].message.content
-                self.get_logger().info(f"VLM response (attempt {attempt}/{vlm_retries}): {raw}")
-                result = json.loads(raw)
-                objects = result.get("objects", [])
-                if objects:
-                    return objects[0]
-                self.get_logger().warn(f"VLM attempt {attempt} returned empty, retrying...")
-                time.sleep(1.0)
-            except json.JSONDecodeError:
-                self.get_logger().error(f"VLM returned invalid JSON on attempt {attempt}.")
-            except Exception as e:
-                self.get_logger().error(f"VLM call failed on attempt {attempt}: {e}")
-
-        # VLM 全部失败（颜色分割已在主路径试过，这里直接放弃）
-        self.get_logger().warn("All VLM attempts failed.")
-        return None
-
-    def backproject_to_3d(self, bbox: list, center=None) -> PointStamped:
-        """2D 中心 + 真实深度（/camera/depth）→ 相机坐标系 3D 点。
-
-        center 为优先使用的 (u,v)（颜色分割给的质心）；为 None 时用 bbox 中心。
-        """
+    def _backproject(self, bbox, center=None):
+        """2D bbox(+质心) → 相机坐标系 3D 点 (X,Y,Z)。"""
+        cam = self.cfg.camera
         if center is not None:
             u, v = center
         else:
             x_min, y_min, x_max, y_max = bbox
             u = (x_min + x_max) / 2.0
             v = (y_min + y_max) / 2.0
-        self.get_logger().info(f"bbox center: u={u:.1f}, v={v:.1f}")
+        self.log.info(f"bbox center: u={u:.1f}, v={v:.1f}")
 
-        # 优先读深度图真实深度；读不到（无深度消息/深度<=0）回退到假设深度
-        assumed_depth = self.cfg.camera.assumed_depth
-        Z = self._read_depth_at(u, v)
+        Z = self._read_assumed_depth()
         if Z is None or Z <= 0.0:
-            self.get_logger().warn(
-                f"No valid depth at ({u:.1f},{v:.1f}), fallback to assumed_depth={assumed_depth}"
+            self.log.warn(
+                f"No valid depth at ({u:.1f},{v:.1f}), fallback to assumed_depth={cam.assumed_depth}"
             )
-            Z = assumed_depth
+            Z = cam.assumed_depth
         else:
-            self.get_logger().info(f"Measured depth at ({u:.1f},{v:.1f}): Z={Z:.4f}")
+            self.log.info(f"Measured depth at ({u:.1f},{v:.1f}): Z={Z:.4f}")
 
-        # 针孔相机模型反投影（内参来自 camera 配置）
-        cam = self.cfg.camera
-        X = (u - cam.cx) * Z / cam.fx
-        Y = (v - cam.cy) * Z / cam.fy
-        self.get_logger().info(f"3D point in camera_link: X={X:.3f}, Y={Y:.3f}, Z={Z:.3f}")
-
-        # demo 阶段 Z 下限保护：base 坐标系下 Z 过低不可达，在 transform_to_base 之后做
-        point = PointStamped()
-        point.header.frame_id = self.cfg.camera.frame_id
-        point.header.stamp = self.get_clock().now().to_msg()
-        point.point.x = float(X)
-        point.point.y = float(Y)
-        point.point.z = float(Z)
-        return point
-
-    def transform_to_base(self, point_camera: PointStamped) -> list:
-        """tf2 转换 camera frame → 机械臂 base frame。"""
-        base_frame = self.cfg.arm.base_frame
-        if self.tf_buffer is None:
-            self.get_logger().error("tf2 not available.")
-            return None
-        try:
-            point_base = self.tf_buffer.transform(
-                point_camera, base_frame, timeout=rclpy.duration.Duration(seconds=2.0)
-            )
-            x = point_base.point.x
-            y = point_base.point.y
-            z = point_base.point.z
-
-            # 可达性保护：X 过近时不可达
-            # Z 不做 clamp —— 输出的 z 是目标中心高度，状态机会加 link8 到指尖偏移
-            if x < self.cfg.arm.reachable_x_min:
-                self.get_logger().warn(
-                    f"X={x:.3f} too close, clamping to {self.cfg.arm.reachable_x_min}"
-                )
-                x = self.cfg.arm.reachable_x_min
-
-            self.get_logger().info(f"3D point in {base_frame}: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
-            return [x, y, z]
-        except Exception as e:
-            self.get_logger().error(f"tf2 transform failed: {e}")
-            return None
+        X, Y, Z = backproject_pinhole(u, v, Z, cam)
+        self.log.info(f"3D point in camera_link: X={X:.3f}, Y={Y:.3f}, Z={Z:.3f}")
+        return X, Y, Z
 
     def command_callback(self, msg):
-        """收到 LLM 指令 → 颜色分割(主)/VLM(兜底) → 反投影 → tf2 → 发布 /robot_command。"""
-        try:
-            cmd = json.loads(msg.data)
-        except json.JSONDecodeError:
-            self.get_logger().error(f"Invalid JSON: {msg.data}")
+        """LLM 指令 → 检测 → 反投影 → tf2 → 发布 /robot_command。"""
+        task = parse_task_command(msg.data)
+        if task is None:
+            self.log.error(f"Invalid JSON: {msg.data}")
             return
-
-        target = cmd.get("target_object")
-        action = cmd.get("action")
-        self.get_logger().info(f"Received LLM command: target={target}, action={action}")
-
-        if action != "pick":
-            self.get_logger().warn(f"Unsupported action: {action}")
+        target = task.target_object
+        self.log.info(f"Received LLM command: target={target}, action={task.action}")
+        if task.action != "pick":
+            self.log.warn(f"Unsupported action: {task.action}")
             return
 
         # 1. 读帧
@@ -345,45 +159,58 @@ class PerceptionNode(Node):
         if img is None:
             return
 
-        # 2. 检测：颜色分割优先（快、准、确定性），失败再 VLM 兜底
-        detection = self._color_detect(img)
+        # 2. 检测：颜色分割优先，失败再 VLM 兜底
+        detection = self.color_detector.detect(target, img)
         if detection is None:
-            self.get_logger().warn("Color detection failed, falling back to VLM.")
-            detection = self.detect_object(target, img)
+            self.log.warn("Color detection failed, falling back to VLM.")
+            detection = self.vlm_detector.detect(target, img)
         if detection is None:
-            self.get_logger().error(f"Failed to detect {target} (color + VLM).")
+            self.log.error(f"Failed to detect {target} (color + VLM).")
             return
         bbox = detection.get("bbox")
         if not bbox or len(bbox) != 4:
-            self.get_logger().error(f"Invalid bbox: {bbox}")
+            self.log.error(f"Invalid bbox: {bbox}")
             return
 
-        # 3. 2D → 3D 反投影
-        point_camera = self.backproject_to_3d(bbox, center=detection.get("center"))
+        # 3. 2D → 3D 反投影（相机坐标系）
+        point_camera = self._backproject(bbox, center=detection.get("center"))
 
-        # 4. tf2 坐标转换
-        position = self.transform_to_base(point_camera)
-        if position is None:
-            self.get_logger().error("Coordinate transform failed.")
+        # 4. tf2 坐标转换到 base frame
+        if self.transformer is None:
+            self.log.error("tf2 not available.")
             return
+        xyz = self.transformer.transform_point(
+            self.cfg.camera.frame_id, point_camera, self.cfg.arm.base_frame
+        )
+        if xyz is None:
+            self.log.error("Coordinate transform failed.")
+            return
+        x, y, z = xyz
 
-        # 4.5 合理性校验：目标应在桌面上方合理范围，挡住 VLM 幻觉（如 Z<0 或越界）
-        x, y, z = position
+        # 可达性保护：base 下 X 过近不可达（Z 不 clamp——状态机负责指尖偏移）
+        if x < self.cfg.arm.reachable_x_min:
+            self.log.warn(
+                f"X={x:.3f} too close, clamping to {self.cfg.arm.reachable_x_min}"
+            )
+            x = self.cfg.arm.reachable_x_min
+        self.log.info(f"3D point in {self.cfg.arm.base_frame}: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+
+        # 5. 合理性校验：目标应在桌面上方合理范围（挡住 VLM 幻觉）
         x_min, x_max, y_min, y_max, z_min, z_max = self.cfg.arm.sanity_box
         if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max):
-            self.get_logger().error(
+            self.log.error(
                 f"Detected position out of table range: ({x:.3f},{y:.3f},{z:.3f}), rejected."
             )
             return
 
-        # 5. 打印检测 vs ground truth 对比（便于发现识别偏差）
-        self._log_gt_comparison(position)
+        # 6. 检测 vs ground truth 对比（发现识别偏差）
+        self._log_gt_comparison([x, y, z])
 
-        # 6. 发布带 3D 位置的指令
+        # 7. 发布带 3D 位置的指令
         robot_cmd = {
             "target_object": target,
-            "action": action,
-            "position": position,
+            "action": task.action,
+            "position": [x, y, z],
         }
         out_msg = String()
         out_msg.data = json.dumps(robot_cmd, ensure_ascii=False)

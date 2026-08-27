@@ -115,3 +115,27 @@ def _build_panda_grasp() -> GraspConfig:
     cfg = build_grasp_config(radius=0.033)
     assert cfg.min_qpos == 0.028, "min_qpos 必须小于 contact_qpos_min"
     return cfg
+
+
+class AdapterBundle:
+    """一个 demo 进程所需的全部协议实现（在宿主节点上装配）。"""
+
+    def __init__(self, arm, gripper, pose_source):
+        self.arm = arm
+        self.gripper = gripper
+        self.pose_source = pose_source
+
+
+def build_adapters(node, config: PickPlaceConfig) -> AdapterBundle:
+    """在宿主 rclpy Node 上创建 MoveItArm/GripperAction/位姿源。
+
+    构造即创建 ROS 资源并 wait_for_server（与原 FSM __init__ 时序一致）。
+    """
+    from ...adapters.gripper_action import GripperAction
+    from ...adapters.moveit_arm import MoveItArm
+    from ...adapters.mujoco_free_joint import MujocoFreeJointPoseSource
+
+    arm = MoveItArm(node, config.arm, config.grasp)
+    gripper = GripperAction(node, config.arm, config.grasp)
+    pose_source = MujocoFreeJointPoseSource(node, config.object.object_id)
+    return AdapterBundle(arm=arm, gripper=gripper, pose_source=pose_source)
