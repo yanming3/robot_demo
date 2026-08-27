@@ -1,0 +1,89 @@
+<mujoco model="scene">
+  <include file="panda.mjcf"/>
+
+  <!--
+    Tighten the viewer's auto-fitted default camera onto the arm + coke so the
+    demo is easier to inspect up close. This only affects the interactive viewer
+    (headless=false); the fixed "camera" (perception) keeps its explicit pose and
+    is untouched. `extent` shrinks the fit radius so the arm/coke fill more of
+    the window; `center` anchors the look-at point between arm (origin) and coke
+    (0.3, 0). You can still zoom/pan/rotate with mouse scroll / right-drag /
+    left-drag in the viewer.
+  -->
+  <statistic center="0.1 0 0.35" extent="0.75"/>
+
+  <!--
+    Viewer default free camera, tuned so the gripper stays visible (mirrors
+    so101_demo_py/assets/mujoco/scene.xml). This arm reaches +X toward the coke
+    and its fingers open along +Y. azimuth=90 (MuJoCo default) puts the camera on
+    +Y, collinear with the finger opening, so the two fingers overlap end-on.
+    azimuth=180 puts it on -X, collinear with the arm's reach, so the gripper
+    hides behind the arm. azimuth=135 + elevation=-20 looks diagonally from
+    behind the base and nearly level, keeping both +X (reach) and +Y (fingers)
+    off-axis so the fingers are seen side-by-side. Still rotatable with
+    left-drag in the viewer.
+  -->
+  <visual>
+    <global azimuth="135" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture name="floor_tex" type="2d" builtin="checker" rgb1="0.2 0.3 0.4" rgb2="0.9 0.9 0.9"
+      width="512" height="512"/>
+    <material name="floor_mat" texture="floor_tex" texrepeat="5 5" reflectance="0.2"/>
+    <material name="table_mat" rgba="0.6 0.45 0.3 1"/>
+    <material name="coke_mat" rgba="1 0.08 0.08 1"/>
+  </asset>
+
+  <worldbody>
+    <!--
+      Coordinate convention: panda_link0 is the world origin (its base sits on
+      the table top at z = 0). This mirrors the Gazebo world's world_to_panda
+      offset (0 0 0.775) with the table top at z = 0.775, simply re-centered so
+      that panda_link0 == world origin == the perception node's TF target frame.
+
+      Everything below is expressed relative to that origin, matching the
+      Gazebo world exactly (identical camera/coke/panda relative geometry).
+    -->
+    <geom name="floor" type="plane" size="3 3 0.05" pos="0 0 -0.775" material="floor_mat"/>
+
+    <!-- Table: static slab 1.2 x 0.8 x 0.05, top surface at z = 0. -->
+    <body name="table" pos="0 0 -0.025">
+      <geom name="table_top" type="box" size="0.6 0.4 0.025" material="table_mat" friction="1 0.1 0.1"/>
+    </body>
+
+    <!-- Coke can: cylinder r=0.033, length=0.122, resting on the table top.
+         Center at z = 0.061 (half-length). -->
+    <body name="coke" pos="0.3 0 0.061">
+      <joint type="free" damping="1.0"/>
+      <inertial mass="0.1" pos="0 0 0" diaginertia="0.0005294 0.0005294 0.0001906"/>
+      <geom name="coke_visual" type="cylinder" size="0.033 0.061" material="coke_mat" contype="0" conaffinity="0"/>
+      <geom name="coke_body" type="box" size="0.033 0.033 0.061" friction="3 0.1 3" group="3"/>
+    </body>
+
+    <!--
+      Fixed camera looking down at the coke. Resolution 640x480, fovy chosen so
+      fx = 554:
+          focal_scaling = (1/tan(fovy/2)) * (height/2) = 554
+        => fovy = 2*atan(240/554) = 46.8457755 deg
+      MuJoCo cameras look along their local -Z; quat computed so the optical
+      convention holds in the published image (u = +X right, v = +Y down).
+    -->
+    <camera name="camera" pos="0.4 0.5 0.625"
+      quat="0.091956951 0.035405950 0.357565380 0.928675044"
+      fovy="46.8457755" resolution="640 480"/>
+  </worldbody>
+
+  <!--
+    Home keyframe: arm at initial_positions.yaml, fingers open, coke resting on
+    the table. MuJoCo pads a partial keyframe's qpos with ZEROS (not qpos0), so
+    the qpos must list every free-joint degree of freedom in order, and ctrl
+    must list every actuator in order (the position gripper's ctrl defaults to
+    0 = fully closed otherwise).
+  -->
+  <keyframe>
+    <key name="home"
+      qpos="0 -0.785 0 -2.356 0 1.571 0.785 0.04 0.04 0.3 0 0.061 1 0 0 0"
+      ctrl="0 -0.785 0 -2.356 0 1.571 0.785 0.04"/>
+  </keyframe>
+</mujoco>

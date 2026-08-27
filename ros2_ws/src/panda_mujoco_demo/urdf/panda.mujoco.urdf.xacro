@@ -1,0 +1,120 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+
+    <xacro:arg name="initial_positions_file"
+        default="$(find panda_mujoco_demo)/config/initial_positions.yaml" />
+    <xacro:arg name="headless" default="false" />
+
+    <!-- Provide the `world` frame the SRDF virtual_joint expects
+         (parent_frame="world", child_link="panda_link0"). Unlike the Gazebo
+         URDF, where world sits on the floor and panda_link0 is offset z=0.775
+         to the table top, the MuJoCo scene already centers panda_link0 at the
+         world origin (see README 5.2), so the fixed joint here is a zero-offset
+         identity transform. This only publishes TF world->panda_link0 for
+         MoveIt's PlanningSceneMonitor; it does not move the MuJoCo body. -->
+    <link name="world" />
+    <joint name="world_to_panda" type="fixed">
+        <parent link="world" />
+        <child link="panda_link0" />
+        <origin xyz="0 0 0" rpy="0 0 0" />
+    </joint>
+
+    <!-- Import the kinematic/visual description (links + joints), verbatim from
+         the Gazebo package so MoveIt and robot_state_publisher see identical
+         link names (panda_link0..8, panda_hand, panda_leftfinger/rightfinger,
+         panda_tcp) and identical joint limits. -->
+    <xacro:include filename="panda.description.urdf.xacro" />
+
+    <!-- Nominal grasp TCP at the center between the closed fingertips. -->
+    <link name="panda_tcp" />
+    <joint name="panda_tcp_joint" type="fixed">
+        <parent link="panda_hand" />
+        <child link="panda_tcp" />
+        <origin xyz="0 0 0.1034" rpy="0 0 0" />
+    </joint>
+
+    <!--
+      Fixed camera. In the MJCF, panda_link0 sits at the world origin, so the
+      camera's world-frame pose (0.4, 0.5, 0.625) is directly the pose relative
+      to panda_link0. The frame name must match the CameraPlugin's frame_name
+      ("camera_link"), and the optical orientation is the RPY form of the
+      verified optical quat (w x y z) = (-0.03540595, 0.09195695, 0.92867504,
+      -0.35756538) so that +X = image right, +Y = image down, +Z = forward.
+    -->
+    <link name="camera_link" />
+    <joint name="camera_joint" type="fixed">
+        <parent link="panda_link0" />
+        <child link="camera_link" />
+        <origin xyz="0.4 0.5 0.625"
+            rpy="-2.4065271566321624 0 2.944197093726518" />
+    </joint>
+
+    <!-- MuJoCo ros2_control: one MujocoSystemInterface drives all 9 joints. -->
+    <ros2_control name="MujocoSystem" type="system">
+        <hardware>
+            <plugin>mujoco_ros2_control/MujocoSystemInterface</plugin>
+            <param name="mujoco_model">$(find panda_mujoco_demo)/mjcf/scene.xml</param>
+            <param name="initial_keyframe">home</param>
+            <param name="sim_speed_factor">1.0</param>
+            <param name="headless">$(arg headless)</param>
+        </hardware>
+
+        <joint name="panda_joint1">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint2">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint3">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint4">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint5">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint6">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_joint7">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_finger_joint1">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+        <joint name="panda_finger_joint2">
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <!--
+          Camera sensor. The sensor name must match the MJCF camera name
+          ("camera"). frame_name must match the URDF link above. This sensor
+          tag supplies the frame/topic parameters to load_legacy_cameras();
+          the explicit mujoco_plugins YAML is the authoritative config.
+        -->
+        <sensor name="camera">
+            <param name="frame_name">camera_link</param>
+            <param name="info_topic">/camera/camera_info</param>
+            <param name="image_topic">/camera</param>
+            <param name="depth_topic">/camera/depth</param>
+        </sensor>
+    </ros2_control>
+</robot>

@@ -1,0 +1,26 @@
+# ── Environment / secrets ─────────────────────────────────────
+# 忽略真实密钥文件 (.env 含 DASHSCOPE/DEEPSEEK key)，保留 .env.example 模板
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Colcon / ROS2 构建产物 (build/ install/ log/ 是 colcon 生成，勿入库)
+build/
+install/
+log/
+
+# 构建日志
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# uv
+.uv/
