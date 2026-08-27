@@ -43,15 +43,17 @@ command -v tmux >/dev/null 2>&1 || { err "tmux 未安装 (brew install tmux)"; e
 [ -f "$ROS_SETUP" ]                   || { err "找不到 ROS 2 setup: $ROS_SETUP"; exit 1; }
 [ -f "$EXTRA_WS/setup.zsh" ]          || { err "找不到 extra_ws: $EXTRA_WS/setup.zsh，请先构建"; exit 1; }
 [ -f "$WS_INSTALL/setup.zsh" ]        || { err "找不到 install: $WS_INSTALL/setup.zsh，请先 colcon build"; exit 1; }
-[ -f "$ENV_FILE" ]                    || { err "找不到 .env 文件。请复制 .env.example 并填入 API key"; exit 1; }
+# API key 来源：~/.zshrc 的 export（推荐）。可选 source .env 作为本地覆盖。
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
 
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
-
-[ -n "${DASHSCOPE_API_KEY:-}" ] || { err ".env 中缺少 DASHSCOPE_API_KEY"; exit 1; }
-[ -n "${DEEPSEEK_API_KEY:-}" ]  || { err ".env 中缺少 DEEPSEEK_API_KEY"; exit 1; }
+# 校验 API key（来源：环境变量 或 .env）
+[ -n "${DASHSCOPE_API_KEY:-}" ] || { err "缺少 DASHSCOPE_API_KEY：请在 ~/.zshrc 中 export，或写入 $ENV_FILE"; exit 1; }
+[ -n "${DEEPSEEK_API_KEY:-}" ]  || { err "缺少 DEEPSEEK_API_KEY：请在 ~/.zshrc 中 export，或写入 $ENV_FILE"; exit 1; }
 
 ATTACH=false
 [[ "${1:-}" == "--attach" ]] && ATTACH=true
