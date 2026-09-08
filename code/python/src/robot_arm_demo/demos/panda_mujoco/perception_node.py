@@ -20,6 +20,7 @@ import threading
 import time
 
 import rclpy
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
@@ -51,15 +52,19 @@ class PerceptionNode(Node):
         )
 
         self.lock = threading.Lock()
-        self.latest_rgb = None
-        self.latest_depth = None
+        # RGB 与 depth 是同一瞬时快照（相机插件打同一 stamp），但它们走两条独立
+        # DDS 话题、两个独立回调，在 MultiThreadedExecutor 下可能被不同线程在不同
+        # 时刻刷写，导致「latest_rgb 新、latest_depth 旧」的帧错位（真实机器人上
+        # 会直接造成 3D / 6D 位姿偏差）。因此用 message_filters 按时间戳把 RGB+D 绑成
+        # 同帧；camera_info 内参静态（不随帧变），取最新即可，无需同步。
+        self.latest_rgbd = None       # (rgb_msg, depth_msg)，已按时间戳对齐
         self.latest_camera_info = None
-        self.create_subscription(
-            Image, self.cfg.camera.rgb_topic, self._rgb_cb, 10
+        self._rgb_sub = Subscriber(self, Image, self.cfg.camera.rgb_topic)
+        self._depth_sub = Subscriber(self, Image, self.cfg.camera.depth_topic)
+        self._rgbd_sync = ApproximateTimeSynchronizer(
+            [self._rgb_sub, self._depth_sub], queue_size=10, slop=0.05
         )
-        self.create_subscription(
-            Image, self.cfg.camera.depth_topic, self._depth_cb, 10
-        )
+        self._rgbd_sync.registerCallback(self._synced_rgbd_cb)
         self.create_subscription(
             CameraInfo, self.cfg.camera.camera_info_topic, self._camera_info_cb, 10
         )
@@ -87,13 +92,10 @@ class PerceptionNode(Node):
 
     # ── 订阅回调 ──
 
-    def _rgb_cb(self, msg):
+    def _synced_rgbd_cb(self, rgb_msg, depth_msg):
+        """message_filters 对齐后的 (RGB, depth) 回调：存为同帧二元组。"""
         with self.lock:
-            self.latest_rgb = msg
-
-    def _depth_cb(self, msg):
-        with self.lock:
-            self.latest_depth = msg
+            self.latest_rgbd = (rgb_msg, depth_msg)
 
     def _camera_info_cb(self, msg):
         with self.lock:
@@ -102,14 +104,26 @@ class PerceptionNode(Node):
     # ── 帧/内参读取 ──
 
     def _read_frame(self):
-        """返回 (rgb(u8 HxWx3), depth(f32 HxW|None), intrinsics{...}, frame_id)。"""
+        """返回 (rgb(u8 HxWx3), depth(f32 HxW|None), intrinsics{...}, frame_id)。
+
+        取 message_filters 对齐后的同帧 RGB+D（保证同一瞬时快照），
+        camera_info 取最新（静态内参）。返回 None 表示尚无对齐帧。
+        """
         with self.lock:
-            rgb_msg = self.latest_rgb
-            depth_msg = self.latest_depth
+            pair = self.latest_rgbd
             info = self.latest_camera_info
-        if rgb_msg is None:
-            self.log.error("No RGB image available.")
+        if pair is None:
+            self.log.error("No synchronized RGB-D frame available yet.")
             return None
+        rgb_msg, depth_msg = pair
+        if getattr(rgb_msg, "header", None) and getattr(depth_msg, "header", None):
+            delta = depth_msg.header.stamp.sec - rgb_msg.header.stamp.sec
+            self.log.info(
+                f"Synchronized RGB-D frame (rgb_mask={rgb_msg.height}x{rgb_msg.width}); "
+                f"rgb.ts={rgb_msg.header.stamp.sec}.{rgb_msg.header.stamp.nanosec} "
+                f"depth.ts={depth_msg.header.stamp.sec}.{depth_msg.header.stamp.nanosec} "
+                f"(delta_s={delta})"
+            )
         self._save_debug(rgb_msg)
         rgb = self._msg_to_rgb(rgb_msg)
         if rgb is None:
