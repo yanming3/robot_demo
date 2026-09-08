@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""感知节点（thin 入口）。
+"""感知节点（thin 入口）—— 云端位姿链路线。
 
-订阅 /camera (RGB) → 收到 LLM 指令后 颜色分割(主)/VLM(兜底) 检测目标物体
-→ bbox 中心 (+假设深度) 内参反投影 → tf2 转换 camera frame → base frame
-→ 发布 /robot_command (JSON, 含目标 3D 位置)。
+订阅 /camera(RGB) + /camera/depth + /camera/camera_info(内参)，
+收到 /llm_command 后：
+  ① 采 RGBD + 真机内参（优先 camera_info，回退 config 默认值）
+  ② POST 云端 /v1/estimate_pose（Grounding-DINO+SAM2 → 位姿；Stage 3 接 FoundationPose）
+     云端不可用时回退本地几何（颜色 mask + 深度点云），不再使用 assumed_depth
+  ③ tf2 变换「完整位姿」camera 系 → base 系（PoseStamped，位置+四元数）
+  ④ 发布 /robot_command { position, orientation(xyzw) }（base 系）
 
-算法与 ROS 管线在 core/adapters；本文件只做装配与编排。
+算法与 wire 契约在 perception_service/，ROS 装配在本文件。
 环境变量:
-    DASHSCOPE_API_KEY  Qwen API 密钥（必需）
+    POSE_SERVICE_URL   云端服务地址（config 已读，默认 http://127.0.0.1:8000）
 """
 
 import json
-import math
 import os
 import threading
 import time
@@ -19,16 +22,15 @@ import time
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
-from openai import OpenAI
 
-from robot_arm_demo.core.camera import backproject_pinhole
-from robot_arm_demo.core.command import parse_task_command
-from robot_arm_demo.adapters.detectors import ColorDetector, QwenVlDetector
-from robot_arm_demo.adapters.logger import RclLogger, Tf2PointTransform
+from robot_arm_demo.adapters.logger import RclLogger, Tf2PoseTransform
 from robot_arm_demo.adapters.mujoco_free_joint import MujocoFreeJointPoseSource
+from robot_arm_demo.core.command import parse_task_command
 from robot_arm_demo.demos.panda_mujoco.config import build_panda_mujoco_config
+from robot_arm_demo.perception_service import contract, geometry_pose
+from robot_arm_demo.perception_service.cloud_client import PoseServiceClient
 
 
 class PerceptionNode(Node):
@@ -37,115 +39,167 @@ class PerceptionNode(Node):
         self.cfg = build_panda_mujoco_config()
         self.log = RclLogger(self.get_logger())
 
-        api_key = os.environ.get("DASHSCOPE_API_KEY")
-        if not api_key:
-            self.get_logger().error("DASHSCOPE_API_KEY not set, exiting.")
+        # 云端位姿服务（Stage 1 mock / Stage 3 FoundationPose，同一契约）
+        if self.cfg.service is None:
+            self.get_logger().error("No pose service configured, exiting.")
             raise SystemExit(1)
-        client = OpenAI(api_key=api_key, base_url=self.cfg.vlm.base_url)
+        self.service = PoseServiceClient(self.cfg.service, self.log)
 
-        # 检测器：颜色分割优先（快、准、确定性），VLM 兜底
-        self.color_detector = ColorDetector(self.cfg.detector, self.log)
-        self.vlm_detector = QwenVlDetector(self.cfg.vlm, client, self.log)
-
-        # 目标物体 ground truth 位姿源（world == base frame），用于偏差对比
+        # 目标物体 ground truth 位姿源（world == base frame），仅用于偏差对比
         self.pose_source = MujocoFreeJointPoseSource(
             self, self.cfg.object.object_id
         )
 
-        self.latest_image = None
-        self.image_lock = threading.Lock()
-        self.image_sub = self.create_subscription(
-            Image, "/camera", self.image_callback, 10
+        self.lock = threading.Lock()
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.latest_camera_info = None
+        self.create_subscription(
+            Image, self.cfg.camera.rgb_topic, self._rgb_cb, 10
         )
-        # NOTE 2026-08-15: 深度图与 tf/RGB 帧存在时序错位，反投影坐标漂移
-        # （Y 0.001→0.032、Z 0.061→0.098），导致夹爪 DESCEND 撞倒可乐。
-        # 已停用深度订阅，回退 camera.assumed_depth（固定场景标定准确）。
+        self.create_subscription(
+            Image, self.cfg.camera.depth_topic, self._depth_cb, 10
+        )
+        self.create_subscription(
+            CameraInfo, self.cfg.camera.camera_info_topic, self._camera_info_cb, 10
+        )
 
         self.command_sub = self.create_subscription(
             String, "/llm_command", self.command_callback, 10
         )
         self.robot_command_pub = self.create_publisher(String, "/robot_command", 10)
 
-        # tf2
-        self.tf_buffer = None
-        self.transformer = None
+        # tf2（PoseStamped 完整位姿变换）
+        self.tf_pose = None
         try:
             import tf2_ros
-            import tf2_geometry_msgs  # noqa: F401 注册 PointStamped
+            import tf2_geometry_msgs  # noqa: F401 注册 PoseStamped
             self.tf_buffer = tf2_ros.Buffer()
             tf2_ros.TransformListener(self.tf_buffer, self)
-            self.transformer = Tf2PointTransform(self, self.tf_buffer, self.log)
+            self.tf_pose = Tf2PoseTransform(self, self.tf_buffer, self.log)
         except ImportError:
             self.get_logger().warn("tf2_ros not available, coordinate transform disabled.")
 
-        self.get_logger().info("Perception node ready. Waiting for commands on /llm_command ...")
-
-    def image_callback(self, msg):
-        with self.image_lock:
-            self.latest_image = msg
-
-    def _get_image(self):
-        """读最新 RGB 帧转 PIL，保存调试图到 /tmp，返回 img 或 None。"""
-        with self.image_lock:
-            if self.latest_image is None:
-                self.get_logger().error("No image available.")
-                return None
-            image_msg = self.latest_image
-        from PIL import Image as PILImage
-        img = PILImage.frombytes(
-            "RGB", (image_msg.width, image_msg.height), bytes(image_msg.data)
+        self.get_logger().info(
+            f"Perception node ready (service={self.cfg.service.base_url}). "
+            "Waiting for commands on /llm_command ..."
         )
-        debug_path = "/tmp/perception_latest.jpg"
-        img.save(debug_path, format="JPEG")
-        self.get_logger().info(f"Saved debug image to {debug_path}")
-        return img
 
-    def _read_assumed_depth(self):
-        """真实深度路径已停用（时序错位致坐标漂移），恒回退假设深度。"""
-        return self.cfg.camera.assumed_depth
+    # ── 订阅回调 ──
+
+    def _rgb_cb(self, msg):
+        with self.lock:
+            self.latest_rgb = msg
+
+    def _depth_cb(self, msg):
+        with self.lock:
+            self.latest_depth = msg
+
+    def _camera_info_cb(self, msg):
+        with self.lock:
+            self.latest_camera_info = msg
+
+    # ── 帧/内参读取 ──
+
+    def _read_frame(self):
+        """返回 (rgb(u8 HxWx3), depth(f32 HxW|None), intrinsics{...}, frame_id)。"""
+        with self.lock:
+            rgb_msg = self.latest_rgb
+            depth_msg = self.latest_depth
+            info = self.latest_camera_info
+        if rgb_msg is None:
+            self.log.error("No RGB image available.")
+            return None
+        self._save_debug(rgb_msg)
+        rgb = self._msg_to_rgb(rgb_msg)
+        if rgb is None:
+            self.log.error("Unsupported RGB encoding.")
+            return None
+        depth = self._msg_to_depth(depth_msg) if depth_msg is not None else None
+        intrinsics, frame_id = self._intrinsics(info, rgb_msg.width, rgb_msg.height)
+        return rgb, depth, intrinsics, frame_id
+
+    def _save_debug(self, rgb_msg):
+        from PIL import Image as PILImage
+        try:
+            arr = self._msg_to_rgb(rgb_msg)
+            PILImage.fromarray(arr).save("/tmp/perception_latest.jpg", format="JPEG")
+            # self.get_logger().info("Saved debug image to /tmp/perception_latest.jpg")
+        except Exception as e:  # noqa: BLE001
+            self.log.warn(f"Failed to save debug image: {e}")
+
+    def _msg_to_rgb(self, msg):
+        h, w = msg.height, msg.width
+        import numpy as np
+        if msg.encoding == "rgb8":
+            return np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3).copy()
+        if msg.encoding == "bgr8":
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3).copy()
+            return arr[:, :, ::-1]
+        return None
+
+    def _msg_to_depth(self, msg):
+        import numpy as np
+        h, w = msg.height, msg.width
+        if msg.encoding == "32FC1":
+            arr = np.frombuffer(msg.data, dtype="<f4").reshape(h, w).copy()
+            arr[~np.isfinite(arr)] = np.nan
+            return arr
+        if msg.encoding == "16UC1":  # mm
+            arr = np.frombuffer(msg.data, dtype="<u2").reshape(h, w).astype(np.float32)
+            arr = arr / 1000.0
+            arr[~np.isfinite(arr)] = np.nan
+            return arr
+        self.log.warn(f"Unsupported depth encoding: {msg.encoding}")
+        return None
+
+    def _intrinsics(self, info, width, height):
+        """优先真机 camera_info，回退 config 默认值（sim）。"""
+        cam = self.cfg.camera
+        if info is not None and info.k and len(info.k) >= 9:
+            fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
+            dist = list(info.d or [])
+            self.log.info(
+                f"Using camera_info intrinsics: fx={fx:.2f} fy={fy:.2f} "
+                f"cx={cx:.2f} cy={cy:.2f}"
+            )
+            frame_id = info.header.frame_id or cam.frame_id
+            return (
+                contract.build_intrinsics(fx, fy, cx, cy, width, height, dist),
+                frame_id,
+            )
+        self.log.warn(
+            "camera_info unavailable, falling back to config default intrinsics "
+            f"(fx={cam.fx}, fy={cam.fy}, cx={cam.cx}, cy={cam.cy})."
+        )
+        return (
+            contract.build_intrinsics(
+                cam.fx, cam.fy, cam.cx, cam.cy, width, height, None
+            ),
+            cam.frame_id,
+        )
 
     def _log_gt_comparison(self, position):
-        """打印检测结果 vs ground truth 的对比与偏差。"""
+        """打印检测结果 vs ground truth（MuJoCo）的对比与偏差。"""
         gt = self.pose_source.get_object_pose(self.cfg.object.object_id)
         if gt is None:
-            self.log.warn("[GT-VLM] 未收到可乐 ground truth（free_joint_states），跳过对比")
+            self.log.warn("[GT] 未收到可乐 ground truth（free_joint_states），跳过对比")
             return
+        import math
         dx = position[0] - gt[0]
         dy = position[1] - gt[1]
         dz = position[2] - gt[2]
         dist = math.hypot(math.hypot(dx, dy), dz)
         self.log.info(
-            f"[GT-VLM] VLM=({position[0]:.4f}, {position[1]:.4f}, "
-            f"{position[2]:.4f})  GT=({gt[0]:.4f}, {gt[1]:.4f}, {gt[2]:.4f})  "
+            f"[GT] est=({position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f})  "
+            f"GT=({gt[0]:.4f}, {gt[1]:.4f}, {gt[2]:.4f})  "
             f"err=({dx:.4f}, {dy:.4f}, {dz:.4f})  dist={dist:.4f}m"
         )
 
-    def _backproject(self, bbox, center=None):
-        """2D bbox(+质心) → 相机坐标系 3D 点 (X,Y,Z)。"""
-        cam = self.cfg.camera
-        if center is not None:
-            u, v = center
-        else:
-            x_min, y_min, x_max, y_max = bbox
-            u = (x_min + x_max) / 2.0
-            v = (y_min + y_max) / 2.0
-        self.log.info(f"bbox center: u={u:.1f}, v={v:.1f}")
-
-        Z = self._read_assumed_depth()
-        if Z is None or Z <= 0.0:
-            self.log.warn(
-                f"No valid depth at ({u:.1f},{v:.1f}), fallback to assumed_depth={cam.assumed_depth}"
-            )
-            Z = cam.assumed_depth
-        else:
-            self.log.info(f"Measured depth at ({u:.1f},{v:.1f}): Z={Z:.4f}")
-
-        X, Y, Z = backproject_pinhole(u, v, Z, cam)
-        self.log.info(f"3D point in camera_link: X={X:.3f}, Y={Y:.3f}, Z={Z:.3f}")
-        return X, Y, Z
+    # ── 指令处理 ──
 
     def command_callback(self, msg):
-        """LLM 指令 → 检测 → 反投影 → tf2 → 发布 /robot_command。"""
+        """LLM 指令 → 云/本地位姿 → tf2 → 发布 /robot_command。"""
         task = parse_task_command(msg.data)
         if task is None:
             self.log.error(f"Invalid JSON: {msg.data}")
@@ -156,63 +210,76 @@ class PerceptionNode(Node):
             self.log.warn(f"Unsupported action: {task.action}")
             return
 
-        # 1. 读帧
-        img = self._get_image()
-        if img is None:
+        frame = self._read_frame()
+        if frame is None:
+            return
+        rgb, depth, intrinsics, frame_id = frame
+
+        # 1. 云端位姿（主路径）
+        prompt = self.cfg.service.prompt_template.format(object=target)
+        req = contract.build_request(
+            rgb, depth, intrinsics, prompt, target, frame_id,
+            return_mask=self.cfg.service.return_mask,
+        )
+        self.log.info(f"POST /v1/estimate_pose ...")
+        res = self.service.estimate(req)
+        position_cam = res.get("position")
+        orient_xyzw = res.get("orientation_xyzw")
+
+        # 2. 本地几何兜底：颜色 mask + 深度点云（不再用 assumed_depth）
+        if position_cam is None or orient_xyzw is None:
+            self.log.warn("Cloud pose failed, falling back to local geometry.")
+            if self.cfg.detector is None or depth is None:
+                self.log.error("No local fallback (detector/depth) available.")
+                return
+            mask = geometry_pose.cola_color_mask(rgb, self.cfg.detector)
+            res = geometry_pose.pose_from_mask(rgb, depth, intrinsics, mask)
+            position_cam = res.get("position")
+            orient_xyzw = res.get("orientation_xyzw")
+        if position_cam is None or orient_xyzw is None:
+            self.log.error("Failed to estimate 6D pose (cloud + local geometry).")
             return
 
-        # 2. 检测：颜色分割优先，失败再 VLM 兜底
-        detection = self.color_detector.detect(target, img)
-        if detection is None:
-            self.log.warn("Color detection failed, falling back to VLM.")
-            detection = self.vlm_detector.detect(target, img)
-        if detection is None:
-            self.log.error(f"Failed to detect {target} (color + VLM).")
-            return
-        bbox = detection.get("bbox")
-        if not bbox or len(bbox) != 4:
-            self.log.error(f"Invalid bbox: {bbox}")
-            return
-
-        # 3. 2D → 3D 反投影（相机坐标系）
-        point_camera = self._backproject(bbox, center=detection.get("center"))
-
-        # 4. tf2 坐标转换到 base frame
-        if self.transformer is None:
+        # 3. tf2 完整位姿 camera → base
+        if self.tf_pose is None:
             self.log.error("tf2 not available.")
             return
-        xyz = self.transformer.transform_point(
-            self.cfg.camera.frame_id, point_camera, self.cfg.arm.base_frame
+        out = self.tf_pose.transform_pose(
+            frame_id, position_cam, orient_xyzw, self.cfg.arm.base_frame
         )
-        if xyz is None:
+        if out is None:
             self.log.error("Coordinate transform failed.")
             return
-        x, y, z = xyz
+        x, y, z, qx, qy, qz, qw = out
 
-        # 可达性保护：base 下 X 过近不可达（Z 不 clamp——状态机负责指尖偏移）
+        # 4. 可达性保护：base 下 X 过近不可达
         if x < self.cfg.arm.reachable_x_min:
             self.log.warn(
                 f"X={x:.3f} too close, clamping to {self.cfg.arm.reachable_x_min}"
             )
             x = self.cfg.arm.reachable_x_min
-        self.log.info(f"3D point in {self.cfg.arm.base_frame}: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
+        self.log.info(
+            f"Base pose: pos=({x:.4f}, {y:.4f}, {z:.4f}) "
+            f"quat(xyzw)=({qx:.4f}, {qy:.4f}, {qz:.4f}, {qw:.4f})"
+        )
 
-        # 5. 合理性校验：目标应在桌面上方合理范围（挡住 VLM 幻觉）
+        # 5. 合理性校验：目标应在桌面上方合理范围
         x_min, x_max, y_min, y_max, z_min, z_max = self.cfg.arm.sanity_box
         if not (x_min <= x <= x_max and y_min <= y <= y_max and z_min <= z <= z_max):
             self.log.error(
-                f"Detected position out of table range: ({x:.3f},{y:.3f},{z:.3f}), rejected."
+                f"Detected pose out of table range: ({x:.3f},{y:.3f},{z:.3f}), rejected."
             )
             return
 
-        # 6. 检测 vs ground truth 对比（发现识别偏差）
+        # 6. 偏差对比（可选）
         self._log_gt_comparison([x, y, z])
 
-        # 7. 发布带 3D 位置的指令
+        # 7. 发布带位置+姿态的指令
         robot_cmd = {
             "target_object": target,
             "action": task.action,
             "position": [x, y, z],
+            "orientation": [qx, qy, qz, qw],
         }
         out_msg = String()
         out_msg.data = json.dumps(robot_cmd, ensure_ascii=False)

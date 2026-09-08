@@ -97,14 +97,21 @@ class GraspConfig:
 
 @dataclass(frozen=True)
 class CameraConfig:
-    """感知相机内参（Pinhole；CameraPlugin 输出须与此一致）。"""
+    """感知相机内参（Pinhole；CameraPlugin 输出须与此一致）。
+
+    fx/fy/cx/cy/assumed_depth 仅为 sim 回退默认值；perception_node 优先从
+    真机 /camera/camera_info 读取内参（见 perception_service.contract）。
+    """
 
     frame_id: str
     fx: float
     fy: float
     cx: float
     cy: float
-    assumed_depth: float           # 无深度图时的假设距离 (m)
+    assumed_depth: float           # 无深度图时的假设距离 (m)；新链路不再使用
+    rgb_topic: str = "/camera"
+    depth_topic: str = "/camera/depth"
+    camera_info_topic: str = "/camera/camera_info"
 
 
 @dataclass(frozen=True)
@@ -120,13 +127,18 @@ class DetectorConfig:
 
 
 @dataclass(frozen=True)
-class VlmConfig:
-    """VLM 兜底检测器（OpenAI 兼容接口）。"""
+class PoseServiceConfig:
+    """云端位姿服务配置（perception_node 用）。
+
+    base_url 形如 "http://127.0.0.1:8000"；客户端 POST {base_url}/v1/estimate_pose。
+    prompt_template 的 {object} 占位符由目标名填充（如 "coke bottle"）。
+    """
 
     base_url: str
-    model: str
-    prompt_template: str   # {target} 占位符
-    max_retries: int
+    timeout_s: float = 15.0
+    retries: int = 2
+    prompt_template: str = "{object}"
+    return_mask: bool = True
 
 
 @dataclass(frozen=True)
@@ -138,7 +150,7 @@ class PickPlaceConfig:
     grasp: GraspConfig
     camera: CameraConfig
     detector: DetectorConfig | None = None   # 感知节点用；纯规划 demo 可省
-    vlm: VlmConfig | None = None             # 颜色分割失败后的兜底
+    service: PoseServiceConfig | None = None # 云端位姿服务；感知节点用
 
 
 @dataclass(frozen=True)
@@ -154,8 +166,15 @@ class TaskCommand:
     position: tuple[float, float, float] | None   # base_frame 下的目标中心 (m)
     destination: str | None = None
     constraints: tuple[str, ...] = ()
+    # 感知云服务新增：抓取时末端姿态（xyzw, base 系）与完整抓取姿态（position+xyzw）
+    orientation: tuple[float, float, float, float] | None = None
+    grasp_pose: tuple[float, float, float, float, float, float, float] | None = None
 
     @property
     def supported(self) -> bool:
-        """与旧行为一致：非 pick 或缺 position → warn 留 IDLE（不抛异常）。"""
+        """与旧行为一致：非 pick 或缺 position → warn 留 IDLE（不抛异常）。
+
+        orientation 可选：云端不可用且本地几何兜底失败时仍可 position-only，
+        由控制器决定是否要求 6D。
+        """
         return self.action == "pick" and self.position is not None

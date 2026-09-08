@@ -1,22 +1,19 @@
-"""感知检测器：颜色分割（主）+ Qwen-VL（兜底）。
+"""感知检测器：颜色分割（旧实现，现已被 geometry_pose 掩码取代，仅存档）。
 
-阈值与提示词从 DetectorConfig/VlmConfig 读取。
+阈值从 DetectorConfig 读取。新感知链路用 perception_service.geometry_pose
+的 cola_color_mask + 深度点云，不再走颜色反投影/assumed_depth。
 """
 
 from __future__ import annotations
 
-import base64
-import json
-import time
-
-from ..core.data import DetectorConfig, VlmConfig
+from ..core.data import DetectorConfig
 
 
 class ColorDetector:
     """颜色分割检测目标物体：特征色掩码 + 最大连通区域质心。
 
-    固定场景（相机固定、光照稳定、目标特征色明显）下亚像素级准且确定性，
-    作为主检测器；VLM 仅在其失败时兜底。
+    固定场景（相机固定、光照稳定、目标特征色明显）下亚像素级准且确定性。
+    （新感知链路已用 perception_service.geometry_pose 的掩码+深度取代本类。）
     """
 
     def __init__(self, detector_cfg: DetectorConfig, logger):
@@ -58,53 +55,3 @@ class ColorDetector:
         )
         return {"name": det.name, "bbox": [x_min, y_min, x_max, y_max],
                 "center": (cx, cy)}
-
-
-class QwenVlDetector:
-    """Qwen-VL 兜底检测（OpenAI 兼容接口）。"""
-
-    def __init__(self, vlm_cfg: VlmConfig, openai_client, logger):
-        self.cfg = vlm_cfg
-        self.client = openai_client
-        self.log = logger
-
-    def detect(self, target_name: str, img) -> dict | None:
-        """调 VLM 检测 bbox；失败重试至多 max_retries 次。"""
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        prompt = self.cfg.prompt_template.format(target=target_name)
-        retries = self.cfg.max_retries
-        for attempt in range(1, retries + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.cfg.model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url",
-                             "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                            {"type": "text", "text": prompt},
-                        ]
-                    }],
-                    response_format={"type": "json_object"},
-                )
-                raw = response.choices[0].message.content
-                self.log.info(
-                    f"VLM response (attempt {attempt}/{retries}): {raw}"
-                )
-                result = json.loads(raw)
-                objects = result.get("objects", [])
-                if objects:
-                    return objects[0]
-                self.log.warn(f"VLM attempt {attempt} returned empty, retrying...")
-                time.sleep(1.0)
-            except json.JSONDecodeError:
-                self.log.error(f"VLM returned invalid JSON on attempt {attempt}.")
-            except Exception as e:
-                self.log.error(f"VLM call failed on attempt {attempt}: {e}")
-
-        self.log.warn("All VLM attempts failed.")
-        return None

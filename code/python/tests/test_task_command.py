@@ -38,3 +38,37 @@ def test_destination_constraints_roundtrip():
     )
     assert task.destination == "bin_a"
     assert task.constraints == ("upright",)
+
+
+def test_orientation_roundtrip():
+    """云端 6D 链路：position + orientation(xyzw)。"""
+    task = parse_task_command(
+        '{"target_object":"可乐","action":"pick",'
+        '"position":[0.3,-0.05,0.3],'
+        '"orientation":[0.0,0.0,0.0,1.0]}'
+    )
+    assert task is not None
+    assert task.position == (0.3, -0.05, 0.3)
+    assert task.orientation == (0.0, 0.0, 0.0, 1.0)
+    assert task.supported
+
+
+def test_grasp_pose_roundtrip():
+    task = parse_task_command(
+        '{"target_object":"可乐","action":"pick",'
+        '"position":[0.3,-0.05,0.3],'
+        '"grasp_pose":[0.3,-0.05,0.3,0.0,0.0,0.0,1.0]}'
+    )
+    assert task is not None
+    assert task.grasp_pose == (0.3, -0.05, 0.3, 0.0, 0.0, 0.0, 1.0)
+    assert task.orientation is None  # 未给 orientation 时保持 None
+
+
+def test_position_only_still_supported():
+    """无 orientation 的旧 payload 仍受支持（不破坏向后兼容）。"""
+    task = parse_task_command(
+        '{"target_object":"可乐","action":"pick","position":[0.3,0.0,0.061]}'
+    )
+    assert task is not None
+    assert task.orientation is None
+    assert task.supported

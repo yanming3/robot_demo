@@ -97,16 +97,3 @@ def test_detector_config_golden():
     assert det.mask_g_max == 40
     assert det.mask_b_max == 40
     assert det.min_pixels == 50
-
-
-def test_vlm_config_golden():
-    vlm = build_panda_mujoco_config().vlm
-    assert vlm is not None
-    assert vlm.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert vlm.model == "qwen-vl-max"
-    assert "{target}" in vlm.prompt_template
-    # format() 后必须是合法 JSON 模板（花括号正确转义）
-    rendered = vlm.prompt_template.format(target="可乐")
-    assert '"objects"' in rendered
-    assert "可乐" in rendered
-    assert vlm.max_retries == 3

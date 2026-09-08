@@ -28,14 +28,14 @@ source ~/study/robot_demo/ros2_ws/install/setup.zsh
 export DYLD_LIBRARY_PATH="$HOME/ros2_jazzy/extra_ws/install/mujoco_vendor/opt/mujoco_vendor/lib:${DYLD_LIBRARY_PATH}"
 ```
 
-API key（预先在 `~/.zshrc` 中 `export`，或用仓库根 `.env` 覆盖）：
+API key（一律从机器环境变量读取，预先在 `~/.zshrc` 中 `export`）：
 
-- `DASHSCOPE_API_KEY` —— 感知节点（Qwen-VL 兜底）
 - `DEEPSEEK_API_KEY` —— LLM Planner
+- （感知节点已改为云端位姿链路，不再需要 Qwen-VL / `DASHSCOPE_API_KEY`）
 
 ```bash
 # 检查是否已设置（缺哪个就在 ~/.zshrc 里补哪个）
-env | grep -E "DASHSCOPE_API_KEY|DEEPSEEK_API_KEY"
+env | grep -E "DEEPSEEK_API_KEY"
 ```
 
 > 说明：步骤顺序是 **venv → ROS 主安装 → extra_ws → 本仓库 ros2_ws**，`setup.zsh` 会把各
@@ -50,7 +50,7 @@ env | grep -E "DASHSCOPE_API_KEY|DEEPSEEK_API_KEY"
 
 ```bash
 cd ~/study/robot_demo
-HEADLESS=false bash scripts/start-demo-mujoco.sh   # GUI 看到机械臂；true 为无 GUI
+HEADLESS=false bash scripts/start-sim-all.sh   # GUI 看到机械臂；true 为无 GUI
 # 查看 / 关闭
 tmux attach -t panda-mujoco
 tmux kill-session -t panda-mujoco

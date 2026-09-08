@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# start-demo-mujoco.sh — Panda pick-place demo on MuJoCo 一键启动（本机 macOS 版）
+# start-sim-all.sh — Panda pick-place demo on MuJoCo 一键启动（本机 macOS 版）
 #
 # 窗格:
 #   0. MuJoCo 仿真 (+ MoveIt2, 需阶段二)  (panda_mujoco.launch.py)
@@ -27,7 +27,6 @@ EXTRA_WS="$HOME/ros2_jazzy/extra_ws/install"
 # 本机: Python3.11 venv (rclpy / colcon / 运行库)
 VENV="$HOME/ros2_jazzy/.venv"
 PYTHON_SRC="$REPO_ROOT/code/python"
-ENV_FILE="$REPO_ROOT/.env"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,17 +42,8 @@ command -v tmux >/dev/null 2>&1 || { err "tmux 未安装 (brew install tmux)"; e
 [ -f "$ROS_SETUP" ]                   || { err "找不到 ROS 2 setup: $ROS_SETUP"; exit 1; }
 [ -f "$EXTRA_WS/setup.zsh" ]          || { err "找不到 extra_ws: $EXTRA_WS/setup.zsh，请先构建"; exit 1; }
 [ -f "$WS_INSTALL/setup.zsh" ]        || { err "找不到 install: $WS_INSTALL/setup.zsh，请先 colcon build"; exit 1; }
-# API key 来源：~/.zshrc 的 export（推荐）。可选 source .env 作为本地覆盖。
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
-fi
-
-# 校验 API key（来源：环境变量 或 .env）
-[ -n "${DASHSCOPE_API_KEY:-}" ] || { err "缺少 DASHSCOPE_API_KEY：请在 ~/.zshrc 中 export，或写入 $ENV_FILE"; exit 1; }
-[ -n "${DEEPSEEK_API_KEY:-}" ]  || { err "缺少 DEEPSEEK_API_KEY：请在 ~/.zshrc 中 export，或写入 $ENV_FILE"; exit 1; }
+# API key 一律从机器环境变量读取（~/.zshrc 的 export），不依赖任何 .env 文件。
+[ -n "${DEEPSEEK_API_KEY:-}" ]  || { err "缺少 DEEPSEEK_API_KEY：请在 ~/.zshrc 中 export DEEPSEEK_API_KEY=sk-..."; exit 1; }
 
 ATTACH=false
 [[ "${1:-}" == "--attach" ]] && ATTACH=true
@@ -85,7 +75,7 @@ tmux send-keys -t "$SESSION_NAME" \
 log "启动感知节点..."
 tmux split-window -h -t "$SESSION_NAME:0"
 tmux send-keys -t "$SESSION_NAME" \
-    "$(common_env); export DASHSCOPE_API_KEY; cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.perception_node" C-m
+    "$(common_env); cd $PYTHON_SRC; PYTHONPATH=src:\$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.perception_node" C-m
 
 log "启动状态机（纯物理夹持）..."
 tmux split-window -v -t "$SESSION_NAME:0.1"
@@ -106,7 +96,7 @@ echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━�
 echo -e "  tmux session:  ${GREEN}$SESSION_NAME${NC}"
 echo -e "  attach:        ${GREEN}tmux attach -t $SESSION_NAME${NC}"
 echo -e "  关闭:          ${RED}tmux kill-session -t $SESSION_NAME${NC}"
-echo -e "  headless 模式: ${YELLOW}HEADLESS=true bash scripts/start-demo-mujoco.sh${NC}"
+echo -e "  headless 模式: ${YELLOW}HEADLESS=true bash scripts/start-sim-all.sh${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "  在 LLM Planner 窗格 (3) 输入: 帮我拿可乐"

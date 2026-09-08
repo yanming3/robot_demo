@@ -3,6 +3,8 @@ perception_node 硬编码常量 1:1 迁入，经 test_panda_config_golden 锁定
 
 from __future__ import annotations
 
+import os
+
 from ...core.data import (
     ArmConfig,
     CameraConfig,
@@ -10,7 +12,7 @@ from ...core.data import (
     GraspConfig,
     ObjectConfig,
     PickPlaceConfig,
-    VlmConfig,
+    PoseServiceConfig,
 )
 from ...core.grasp import build_grasp_config
 
@@ -74,7 +76,11 @@ def build_panda_mujoco_config() -> PickPlaceConfig:
         cx=320.0,
         cy=240.0,
         # MuJoCo 可乐中心 (0.3,0,0.061)、相机 (0.4,0.5,0.625) 的直线距离。
+        # 仅作 sim 兜底默认值；新链路 perception_node 优先读真机 camera_info。
         assumed_depth=0.76,
+        rgb_topic="/camera",
+        depth_topic="/camera/depth",
+        camera_info_topic="/camera/camera_info",
     )
 
     # 颜色分割：可乐材质 rgba=(1,0.08,0.08) 渲染后 ≈ RGB(95,8,6)，顶部有
@@ -89,15 +95,14 @@ def build_panda_mujoco_config() -> PickPlaceConfig:
         min_pixels=50,
     )
 
-    # VLM 兜底（Qwen-VL，OpenAI 兼容接口）
-    vlm = VlmConfig(
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        model="qwen-vl-max",
-        prompt_template="""图片尺寸是 640x480 像素。这是机器人仿真相机俯视拍摄桌面的图片。
-请仔细识别图中的"{target}"（红色罐装饮料），返回它的 bounding box。
-格式：{{"objects": [{{"name": "{target}", "bbox": [x_min, y_min, x_max, y_max]}}]}}
-坐标必须在 0-640 (x) 和 0-480 (y) 范围内。只返回 JSON。如果看不到，返回 {{"objects": []}}。""",
-        max_retries=3,
+    # 云端位姿服务（Grounding-DINO+SAM2 + FoundationPose）。base_url 可经
+    # 环境变量 POSE_SERVICE_URL 覆盖；本地 mock 默认 127.0.0.1:8000。
+    service = PoseServiceConfig(
+        base_url=os.environ.get("POSE_SERVICE_URL", "http://127.0.0.1:8000"),
+        timeout_s=15.0,
+        retries=2,
+        prompt_template="{object} bottle",
+        return_mask=True,
     )
 
     return PickPlaceConfig(
@@ -106,7 +111,7 @@ def build_panda_mujoco_config() -> PickPlaceConfig:
         grasp=grasp,
         camera=camera,
         detector=detector,
-        vlm=vlm,
+        service=service,
     )
 
 

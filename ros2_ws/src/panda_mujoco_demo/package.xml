@@ -3,8 +3,8 @@
 <package format="3">
   <name>panda_mujoco_demo</name>
   <version>0.0.0</version>
-  <description>Panda pick-place demo on MuJoCo (mujoco_ros2_control), mirroring the Gazebo demo.</description>
-  <maintainer email="zjumty@aliyun.com">lenovo</maintainer>
+  <description>Panda pick-place demo on MuJoCo (mujoco_ros2_control).</description>
+  <maintainer email="yanming3@hotmail.com">allan.yan</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

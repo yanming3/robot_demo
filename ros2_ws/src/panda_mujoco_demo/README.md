@@ -251,17 +251,15 @@ source ~/robot_demo_001/moveit-demo/install/setup.bash
 
 ### 7.4 配置 API Key
 
-```bash
-cp ~/robot_demo_001/.env.example ~/robot_demo_001/.env
-nano ~/robot_demo_001/.env
-```
-
-`.env` 文件需填入：
+密钥一律从机器环境变量读取（不依赖任何 `.env` 文件）。在 `~/.zshrc` 中 `export`：
 
 ```
-DASHSCOPE_API_KEY=sk-...    # 阿里云 Qwen-VL API Key
-DEEPSEEK_API_KEY=sk-...     # DeepSeek API Key
+export DEEPSEEK_API_KEY=sk-...     # DeepSeek API Key
+# 感知节点已改为云端位姿链路（Grounding-DINO+SAM2/FoundationPose），
+# 不再需要 DASHSCOPE_API_KEY (阿里云 Qwen-VL)。
 ```
+
+然后 `source ~/.zshrc`（或开新终端）。
 
 ### 7.5 GUI 访问（TigerVNC）
 
@@ -289,10 +287,10 @@ ssh -i loginpair.pem -L 5901:localhost:5901 allan@47.116.100.143 -N &
 cd ~/robot_demo_001
 
 # 有 GUI（需要 VNC）
-bash scripts/start-demo-mujoco.sh
+bash scripts/start-sim-all.sh
 
 # Headless 模式（无 GUI，云服务器推荐）
-HEADLESS=true bash scripts/start-demo-mujoco.sh
+HEADLESS=true bash scripts/start-sim-all.sh
 ```
 
 脚本会创建一个名为 `panda-mujoco` 的 tmux session，包含 4 个窗格：
@@ -337,7 +335,7 @@ ros2 launch panda_mujoco_demo panda_mujoco.launch.py headless:=true
 # 终端 2：感知节点
 source /opt/ros/jazzy/setup.bash
 source ~/robot_demo_001/moveit-demo/install/setup.bash
-export DASHSCOPE_API_KEY=sk-...
+# 感知节点已改为云端位姿链路，不再需要 DASHSCOPE_API_KEY
 cd ~/robot_demo_001/code/python
 PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.ros2.perception_node
 

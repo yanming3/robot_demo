@@ -1,8 +1,6 @@
 # ── Environment / secrets ─────────────────────────────────────
-# 忽略真实密钥文件 (.env 含 DASHSCOPE/DEEPSEEK key)，保留 .env.example 模板
-.env
-.env.*
-!.env.example
+# 密钥一律从机器环境变量读取（~/.zshrc export），不依赖任何本地 .env 文件。
+# （.env / .env.example 已不纳入仓库。）
 
 # macOS
 .DS_Store

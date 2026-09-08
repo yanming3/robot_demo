@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import rclpy.duration
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
 
 
@@ -50,4 +50,46 @@ class Tf2PointTransform:
             return out.point.x, out.point.y, out.point.z
         except Exception as e:
             self.log.error(f"tf2 transform failed: {e}")
+            return None
+
+
+class Tf2PoseTransform:
+    """tf2 Buffer 封装：PoseStamped → target_frame 的完整位姿。
+
+    与 Tf2PointTransform 不同：本类同时变换位置与四元数（xyzw），供 6D 感知
+    链路把 camera 系位姿变换到 base 系。stamp 取宿主节点当前时钟，
+    timeout 2s 等待变换可用。
+    """
+
+    def __init__(self, node: Node, buffer, logger):
+        self.node = node
+        self.buffer = buffer
+        self.log = logger
+
+    def transform_pose(
+        self, source_frame: str, pose_xyz, pose_wxyz, target_frame: str
+    ):
+        """返回 (x, y, z, qx, qy, qz, qw) 或 None（失败）。"""
+        pose = PoseStamped()
+        pose.header.frame_id = source_frame
+        pose.header.stamp = self.node.get_clock().now().to_msg()
+        pose.pose.position.x = float(pose_xyz[0])
+        pose.pose.position.y = float(pose_xyz[1])
+        pose.pose.position.z = float(pose_xyz[2])
+        pose.pose.orientation.x = float(pose_wxyz[0])
+        pose.pose.orientation.y = float(pose_wxyz[1])
+        pose.pose.orientation.z = float(pose_wxyz[2])
+        pose.pose.orientation.w = float(pose_wxyz[3])
+        try:
+            out = self.buffer.transform(
+                pose, target_frame,
+                timeout=rclpy.duration.Duration(seconds=2.0),
+            )
+            return (
+                out.pose.position.x, out.pose.position.y, out.pose.position.z,
+                out.pose.orientation.x, out.pose.orientation.y,
+                out.pose.orientation.z, out.pose.orientation.w,
+            )
+        except Exception as e:
+            self.log.error(f"tf2 pose transform failed: {e}")
             return None

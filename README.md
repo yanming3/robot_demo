@@ -33,10 +33,16 @@ DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划
 ```
 用户: 帮我拿可乐
  → [llm_planner]  DeepSeek 解析 → /llm_command {"target_object":"可乐","action":"pick"}
- → [perception_node]  颜色分割(bounding box) → 深度反投影 + tf 相机→世界 → {action,position} → /robot_command
+ → [perception_node]  采 RGBD+真机内参 → POST 云端 /v1/estimate_pose（Grounding-DINO+SAM2→6D 位姿；Stage 3 接 FoundationPose）
+                       → tf2 完整位姿 camera→base → {action,position,orientation} → /robot_command
  → [pick_place_state_machine]  MoveIt 规划(/move_action) + 夹爪(/panda_hand_controller/gripper_cmd) + 纯物理夹持
  → [mujoco_ros2_control]  仿真执行 /joint_states 反馈
 ```
+
+> 感知已改为「RGBD → 云端分割+位姿 → 本地 tf2」链路（不再用固定 `assumed_depth`/点云中心）。
+> 云端契约见 `docs/perception_pose_service_contract.md`；Stage 1 本地可用
+> `python -m robot_arm_demo.perception_service.mock_server` 起 mock（Grounding-DINO+SAM2
+> 与 FoundationPose 在 Stage 3 接入时替换，本地契约不变）。
 
 ---
 
@@ -65,17 +71,24 @@ DeepSeek 解析指令 → Qwen-VL + 颜色分割定位可乐 → MoveIt 2 规划
 │       │   ├── moveit_arm.py          #   MoveGroup action + Planning Scene → ArmController
 │       │   ├── gripper_action.py      #   GripperCommand action → Gripper
 │       │   ├── mujoco_free_joint.py   #   FreeJointStateArray → ObjectPoseSource
-│       │   └── detectors.py           #   颜色分割(主) + Qwen-VL(兜底)
+│       │   └── detectors.py           #   ColorDetector（旧，已存档；Qwen-VL 兜底已移除）
+│       ├── perception_service/        # ★ 云端感知位姿链路（零 ROS，可单测）
+│       │   ├── contract.py            #   wire 契约编码/解析（字段/单位/坐标系唯一来源）
+│       │   ├── geometry_pose.py       #   Stage 1：mask+深度 → 中心+瓶轴（mock/兜底用）
+│       │   ├── cloud_client.py        #   POST /v1/estimate_pose 的本地 HTTP 客户端
+│       │   └── mock_server.py         #   Stage 1 mock 服务（http.server，零依赖）
 │       └── demos/panda_mujoco/        # ★ 本 demo：配置 + thin 启动节点
 │           ├── config.py              #   全部机器人/物体/相机参数（新臂只改这里）
-│           ├── perception_node.py     #   Qwen-VL / 颜色分割 → /robot_command
+│           ├── perception_node.py     #   云/本地位姿 → /robot_command（含 orientation）
 │           ├── pick_place_state_machine.py  # MoveIt + 夹爪 + 纯物理夹持
 │           ├── llm_planner.py         #   DeepSeek → /llm_command
 │           └── coke_pose_monitor.py   #   调试用 (可乐真实位姿回放)
+├── docs/
+│   └── perception_pose_service_contract.md  # 云端感知位姿服务的 API 契约
 ├── scripts/
-│   └── start-demo-mujoco.sh          # tmux 一键启动 (4 窗格: sim+MoveIt / 感知 / 状态机 / LLM)
+│   ├── start-sim-all.sh          # tmux 一键启动 (4 窗格: sim+MoveIt / 感知 / 状态机 / LLM)
+│   └── start-mock-all.sh         # tmux 一键全栈: sim + mock + 感知 + 状态机 + LLM
 ├── ros2-build/                       # 本机构建脚本 + runbook (ROS2/mujoco 编译 + 补丁)
-└── .env.example                     # API key 模板（真实 key 经 ~/.zshrc export）
 ```
 
 > **添加新机械臂 demo**：`core/` 与 `adapters/` 机器人无关，新臂无需改动它们。只需
@@ -166,7 +179,7 @@ colcon build --symlink-install --packages-select panda_mujoco_demo moveit_resour
 ### 4.1 一键启动（推荐）
 ```bash
 cd ~/study/robot_demo
-HEADLESS=false bash scripts/start-demo-mujoco.sh   # GUI 看到机械臂
+HEADLESS=false bash scripts/start-sim-all.sh   # GUI 看到机械臂
 # 或用 tmux 查看/关闭:
 tmux attach -t panda-mujoco
 tmux kill-session -t panda-mujoco
@@ -192,8 +205,11 @@ ros2 launch panda_mujoco_demo panda_mujoco.launch.py headless:=false
 source ~/ros2_jazzy/.venv/bin/activate
 source ~/ros2_jazzy/install/setup.zsh; source ~/ros2_jazzy/extra_ws/install/setup.zsh; source ~/study/robot_demo/ros2_ws/install/setup.zsh
 export DYLD_LIBRARY_PATH=".../mujoco_vendor/opt/mujoco_vendor/lib:${DYLD_LIBRARY_PATH}"
-# 若 ~/.zshrc 已 export 则无需此行，否则：export DASHSCOPE_API_KEY=sk-...
-cd ~/study/robot_demo/code/python && PYTHONPATH=src:$PYTHONPATH python3 -m robot_arm_demo.demos.panda_mujoco.perception_node
+# ① 先起云端位姿服务（Stage 1 用 mock；云端 GPU 服务接好后改 POSE_SERVICE_URL）：
+cd ~/study/robot_demo/code/python && PYTHONPATH=src python3 -m robot_arm_demo.perception_service.mock_server   # 默认 8000
+# ② 再起感知节点（不再需要 DASHSCOPE_API_KEY；新链路内参读真机 camera_info）：
+export POSE_SERVICE_URL=http://127.0.0.1:8000
+cd ~/study/robot_demo/code/python && PYTHONPATH=src python3 -m robot_arm_demo.demos.panda_mujoco.perception_node
 ```
 ```bash
 # 终端 2: 状态机
@@ -241,7 +257,7 @@ ros2 topic list | grep -E "camera|robot_command|llm_command|joint_states"
 - `mjcf/scene.xml`：场景（桌子、可乐、摄像头、home 关键帧）；`<geom>` 摩擦、可乐尺寸。
 - `urdf/panda.mujoco.urdf.xacro`：`MujocoSystemInterface` + `CameraPlugin` + `camera_link` TF。
 - `pick_place_state_machine.py`：`GRIPPER_GRASP_POS`（夹持过盈量）、夹持高度、`max_effort`。
-- **API key**：在 `~/.zshrc` 中 export `DASHSCOPE_API_KEY`(Qwen-VL) + `DEEPSEEK_API_KEY`(DeepSeek)。详见 `.env.example`。
+- **API key**：在 `~/.zshrc` 中 `export DEEPSEEK_API_KEY=sk-...`（DeepSeek, LLM Planner）。密钥一律从机器环境变量读取，不依赖任何 `.env` 文件。感知节点已改为云端位姿链路，**不再需要** `DASHSCOPE_API_KEY`(Qwen-VL)。
 
 ### 5.3 关键物理解调参数（抓取）
 | 参数 | 值 | 说明 |

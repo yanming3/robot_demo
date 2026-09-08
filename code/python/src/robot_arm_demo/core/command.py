@@ -20,10 +20,14 @@ def parse_task_command(text: str) -> TaskCommand | None:
     except json.JSONDecodeError:
         return None
     position = cmd.get("position")
+    orientation = cmd.get("orientation")
+    grasp_pose = cmd.get("grasp_pose")
     return TaskCommand(
         target_object=cmd.get("target_object"),
         action=cmd.get("action"),
         position=tuple(position) if position is not None else None,
         destination=cmd.get("destination"),
         constraints=tuple(cmd.get("constraints") or ()),
+        orientation=tuple(orientation) if orientation is not None else None,
+        grasp_pose=tuple(grasp_pose) if grasp_pose is not None else None,
     )
