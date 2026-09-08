@@ -33,6 +33,9 @@ from robot_arm_demo.demos.panda_mujoco.config import build_panda_mujoco_config
 from robot_arm_demo.perception_service import contract, geometry_pose
 from robot_arm_demo.perception_service.cloud_client import PoseServiceClient
 
+# 相机回调诊断日志的节流间隔（帧）。相机 ~30Hz，每 50 帧 ≈1.6s 打一次摘要。
+_CAMERA_LOG_EVERY = 50
+
 
 class PerceptionNode(Node):
     def __init__(self):
@@ -59,6 +62,9 @@ class PerceptionNode(Node):
         # 同帧；camera_info 内参静态（不随帧变），取最新即可，无需同步。
         self.latest_rgbd = None       # (rgb_msg, depth_msg)，已按时间戳对齐
         self.latest_camera_info = None
+        # 回调诊断日志计数（相机 ~30Hz，节流后定期打印，避免刷屏）
+        self._rgbd_frames = 0
+        self._camera_info_frames = 0
         self._rgb_sub = Subscriber(self, Image, self.cfg.camera.rgb_topic)
         self._depth_sub = Subscriber(self, Image, self.cfg.camera.depth_topic)
         self._rgbd_sync = ApproximateTimeSynchronizer(
@@ -92,14 +98,65 @@ class PerceptionNode(Node):
 
     # ── 订阅回调 ──
 
+    @staticmethod
+    def _fmt_stamp(msg):
+        try:
+            return f"{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}"
+        except Exception:  # noqa: BLE001
+            return "?"
+
     def _synced_rgbd_cb(self, rgb_msg, depth_msg):
-        """message_filters 对齐后的 (RGB, depth) 回调：存为同帧二元组。"""
+        """message_filters 对齐后的 (RGB, depth) 回调：存为同帧二元组，并节流打日志。"""
         with self.lock:
             self.latest_rgbd = (rgb_msg, depth_msg)
+        self._rgbd_frames += 1
+        # 首帧 & 之后每 _CAMERA_LOG_EVERY 帧打一次诊断日志
+        if self._rgbd_frames == 1 or self._rgbd_frames % _CAMERA_LOG_EVERY == 0:
+            same = (
+                rgb_msg.header.stamp.sec == depth_msg.header.stamp.sec
+                and rgb_msg.header.stamp.nanosec == depth_msg.header.stamp.nanosec
+            )
+            size_ok = (
+                rgb_msg.width == depth_msg.width and rgb_msg.height == depth_msg.height
+            )
+            self.log.info(
+                f"[RGBD-CB] n={self._rgbd_frames} "
+                f"rgb={rgb_msg.width}x{rgb_msg.height} '{rgb_msg.encoding}' "
+                f"bytes={len(rgb_msg.data)} frame={rgb_msg.header.frame_id} "
+                f"ts={self._fmt_stamp(rgb_msg)} | "
+                f"depth={depth_msg.width}x{depth_msg.height} '{depth_msg.encoding}' "
+                f"bytes={len(depth_msg.data)} frame={depth_msg.header.frame_id} "
+                f"ts={self._fmt_stamp(depth_msg)} | "
+                f"same_stamp={same} size_ok={size_ok}"
+            )
+        if (
+            rgb_msg.width != depth_msg.width or rgb_msg.height != depth_msg.height
+        ):
+            self.log.warn(
+                f"[RGBD-CB] RGB 与 depth 分辨率不一致: "
+                f"rgb={rgb_msg.width}x{rgb_msg.height}, "
+                f"depth={depth_msg.width}x{depth_msg.height}"
+            )
 
     def _camera_info_cb(self, msg):
         with self.lock:
             self.latest_camera_info = msg
+        self._camera_info_frames += 1
+        if self._camera_info_frames == 1 or self._camera_info_frames % _CAMERA_LOG_EVERY == 0:
+            # 注意：ROS2 CameraInfo.k 是 numpy.ndarray，不能用 `or []`（truth 歧义）
+            k = list(msg.k) if msg.k is not None else []
+            if len(k) >= 9:
+                fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+            else:
+                fx = fy = cx = cy = float("nan")
+            dist = [round(float(x), 4) for x in (msg.d if msg.d is not None else [])]
+            self.log.info(
+                f"[CAMINFO-CB] n={self._camera_info_frames} "
+                f"frame={msg.header.frame_id} {msg.width}x{msg.height} "
+                f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f} "
+                f"dist={dist} "
+                f"ts={self._fmt_stamp(msg)}"
+            )
 
     # ── 帧/内参读取 ──
 
@@ -170,9 +227,11 @@ class PerceptionNode(Node):
     def _intrinsics(self, info, width, height):
         """优先真机 camera_info，回退 config 默认值（sim）。"""
         cam = self.cfg.camera
-        if info is not None and info.k and len(info.k) >= 9:
-            fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
-            dist = list(info.d or [])
+        # 注意：ROS2 CameraInfo.k 是 numpy.ndarray，不能用 `info.k and ...`（truth 歧义）
+        if info is not None and info.k is not None and len(info.k) >= 9:
+            fx, fy, cx, cy = float(info.k[0]), float(info.k[4]), \
+                float(info.k[2]), float(info.k[5])
+            dist = list(info.d if info.d is not None else [])
             self.log.info(
                 f"Using camera_info intrinsics: fx={fx:.2f} fy={fy:.2f} "
                 f"cx={cx:.2f} cy={cy:.2f}"

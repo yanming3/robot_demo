@@ -94,7 +94,9 @@ def build_intrinsics(
     distortion_k: Sequence[float] | None = None,
 ) -> dict:
     """组装 camera_intrinsics 子字典（内参/尺寸/畸变）。"""
-    k = list(distortion_k or [0.0] * 5)
+    # 防御：distortion_k 可能是 numpy.ndarray（如直接传 CameraInfo.d），
+    # 不能用 `or [...]`（数组 truth 歧义），先转成 list。
+    k = list(distortion_k) if distortion_k is not None else [0.0] * 5
     if len(k) < 5:
         k = k + [0.0] * (5 - len(k))
     k = k[:5]
